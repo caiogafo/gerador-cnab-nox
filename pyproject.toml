@@ -1,0 +1,46 @@
+[project]
+name = "gerador-cnab-nox"
+version = "0.1.0"
+description = "Gerador local e auditável de CNAB 444 para cessões NOX"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "openpyxl>=3.1.5,<4",
+  "xlrd>=2.0.1,<3",
+]
+
+[project.gui-scripts]
+gerador-cnab-nox = "gerador_cnab_nox.gui:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+  "ruff>=0.12,<1",
+  "xlwt>=1.3,<2",
+]
+windows = [
+  "pyinstaller>=6.14,<7",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gerador_cnab_nox"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers --disable-warnings"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.coverage.run]
+branch = true
+source = ["gerador_cnab_nox"]

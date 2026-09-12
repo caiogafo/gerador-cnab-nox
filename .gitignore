@@ -1,0 +1,38 @@
+# Arquivos operacionais e de referência (podem conter dados pessoais)
+*.xls
+*.xlsx
+*.xlsb
+*.xlsm
+*.csv
+*.txt
+*.pdf
+*.mp4
+
+# Saídas locais
+saida/
+outputs/
+logs/
+*.jsonl
+
+# Python / testes / empacotamento
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.spec
+
+# IDE / sistema
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# As fixtures versionadas ficam sob tests/fixtures e usam somente dados sintéticos.
+!tests/fixtures/**/*.csv
+!tests/fixtures/**/*.txt
+!tests/fixtures/**/*.xlsx
