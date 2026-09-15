@@ -6,13 +6,14 @@ import os
 import threading
 import time
 from decimal import Decimal
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
 import gerador_cnab_nox.gui as gui
 from gerador_cnab_nox.errors import ValidationError
-from gerador_cnab_nox.gui_messages import explain_issue, money
+from gerador_cnab_nox.gui_messages import explain_issue, explain_pending, money
 from gerador_cnab_nox.models import GenerationResult, PreparationResult
 from tests.test_gui import (
     _choose_modality,
@@ -91,6 +92,112 @@ def test_navigation_paths_staleness_and_separate_file_results(
     assert app.pfmi_commission.get() == "0"
 
 
+def test_new_batch_button_clears_pfmis_sources_dates_and_results(
+    tmp_path, monkeypatch, gui_application
+):
+    root, app, _ = gui_application
+    _setup_sources(root, app, monkeypatch, tmp_path)
+    assert app.pfmi_tree.get_children()
+    excel = tmp_path / "preparado.xlsx"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **_: str(excel))
+    app.prepare_button.invoke()
+    _wait_for_idle(root, app)
+    assert app.prepared_path.get() == str(excel)
+
+    app.new_batch_button.invoke()
+
+    assert app.current_step == 1
+    assert not app.pfmi_tree.get_children()
+    assert not app._pfmi_rows
+    assert app.pfmi_count.get() == "0 PFMIs"
+    assert app.analytic.get() == ""
+    assert app.due.get() == ""
+    assert app.liquidation.get() == ""
+    assert app.sequence.get() == ""
+    assert app.prepared_path.get() == ""
+    assert app.intermediate.get() == ""
+    assert app._prepared_signature is None
+    assert app.review_result.title.cget("text") == "Pronto para preparar"
+    assert str(app.prepare_button.cget("state")) == "normal"
+    assert not app.open_excel_button.winfo_manager()
+    assert not app.continue_generate_button.winfo_manager()
+    assert not app.prepared_files.winfo_manager()
+    assert app.summary_label.winfo_manager() == "pack"
+
+    # A fresh selection right after reset must not resurrect anything cleared.
+    novo_lote_dir = tmp_path / "novo_lote"
+    novo_lote_dir.mkdir()
+    next_pfmis, next_analytic, next_due = _single_normal_sources(novo_lote_dir)
+    monkeypatch.setattr(
+        gui.filedialog, "askopenfilenames", lambda **_: tuple(map(str, next_pfmis))
+    )
+    app.add_pfmi_button.invoke()
+    assert len(app.pfmi_tree.get_children()) == len(next_pfmis)
+
+
+def test_new_batch_after_generate_button_resets_and_returns_to_step_1(
+    tmp_path, monkeypatch, gui_application
+):
+    root, app, _ = gui_application
+    _setup_sources(root, app, monkeypatch, tmp_path)
+    excel = tmp_path / "preparado.xlsx"
+    txt = tmp_path / "gerado.txt"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **_: str(excel))
+    app.prepare_button.invoke()
+    _wait_for_idle(root, app)
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **_: str(txt))
+    app.intermediate.set(str(excel))
+    app.generate_button.invoke()
+    _wait_for_idle(root, app)
+    assert app.generated_path.get() == str(txt)
+
+    app.new_batch_after_generate_button.invoke()
+
+    assert app.current_step == 1
+    assert not app._pfmi_rows
+    assert app.generated_path.get() == ""
+    assert app.prepared_path.get() == ""
+    assert app.intermediate.get() == ""
+
+
+def test_add_pfmis_replaces_by_default_and_accumulates_explicitly(
+    tmp_path, monkeypatch, gui_application
+):
+    root, app, _ = gui_application
+    primeiro_dir, segundo_dir = tmp_path / "primeiro", tmp_path / "segundo"
+    primeiro_dir.mkdir()
+    segundo_dir.mkdir()
+    first_pfmis, _, _ = _single_normal_sources(primeiro_dir)
+    second_pfmis, _, _ = _single_normal_sources(segundo_dir)
+
+    monkeypatch.setattr(
+        gui.filedialog, "askopenfilenames", lambda **_: tuple(map(str, first_pfmis))
+    )
+    app.add_pfmi_button.invoke()
+    assert len(app.pfmi_tree.get_children()) == len(first_pfmis)
+
+    # Default action (used again) replaces, so files from an unrelated
+    # earlier batch (e.g. a different liquidation date) never accumulate
+    # silently into the current one.
+    monkeypatch.setattr(
+        gui.filedialog, "askopenfilenames", lambda **_: tuple(map(str, second_pfmis))
+    )
+    app.add_pfmi_button.invoke()
+    assert len(app.pfmi_tree.get_children()) == len(second_pfmis)
+    assert {row.path for row in app._pfmi_rows.values()} == {str(p) for p in second_pfmis}
+
+    # The explicit "Adicionar mais PFMIs" action is the only way to combine
+    # files into the same batch (e.g. Normal + Cessão da Cessão).
+    monkeypatch.setattr(
+        gui.filedialog, "askopenfilenames", lambda **_: tuple(map(str, first_pfmis))
+    )
+    app.add_more_pfmi_button.invoke()
+    assert len(app.pfmi_tree.get_children()) == len(second_pfmis) + len(first_pfmis)
+    assert {row.path for row in app._pfmi_rows.values()} == {
+        str(p) for p in second_pfmis
+    } | {str(p) for p in first_pfmis}
+
+
 def test_busy_job_keeps_event_loop_and_snapshots_on_main_thread(
     tmp_path, monkeypatch, gui_application
 ):
@@ -101,12 +208,13 @@ def test_busy_job_keeps_event_loop_and_snapshots_on_main_thread(
     entered, release = threading.Event(), threading.Event()
     calls = []
     main_ident = threading.get_ident()
+    real_prepare = gui.prepare_workbook
 
     def service(pfmis, analytic, due, **kwargs):
         calls.append((threading.get_ident(), pfmis, analytic, due, kwargs))
         entered.set()
         assert release.wait(5)
-        return PreparationResult(destination, 1, 1, 0, (), 1, 1)
+        return real_prepare(pfmis, analytic, due, **kwargs)
 
     monkeypatch.setattr(gui, "prepare_workbook", service)
     app.prepare_button.invoke()
@@ -142,6 +250,223 @@ def test_busy_job_keeps_event_loop_and_snapshots_on_main_thread(
     assert str(app.commission_entry.cget("state")) == "disabled"
     assert str(app.move_up_button.cget("state")) == "disabled"
     assert app._poll_id is None
+
+
+def test_preparation_composition_summary_completes_on_tk_thread(
+    tmp_path, monkeypatch, gui_application,
+):
+    from openpyxl import load_workbook
+
+    root, app, _ = gui_application
+    root.geometry("1040x700")
+    root.deiconify()
+    pfmis, _, _ = _setup_sources(root, app, monkeypatch, tmp_path)
+    book = load_workbook(pfmis[0])
+    sheet = book.active
+    sheet.cell(3, 1, 60)
+    sheet.cell(3, 9, 60)
+    row = [c.value for c in sheet[3]]
+    row[0] = row[8] = 40
+    row[2] = "REPRESENTANTE (EMPRESA NORMAL)"
+    row[3] = "REPRESENTANTE"
+    sheet.append(row)
+    book.save(pfmis[0])
+    book.close()
+    target = tmp_path / "composition.xlsx"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **_: str(target))
+    main_thread = threading.get_ident()
+    read_threads, completion_threads, after_calls, callback_errors, redraws = [], [], [], [], []
+    real_read, real_completed = gui.read_intermediate, app._prepared
+    real_after, real_redraw = root.after, root.update_idletasks
+
+    def read(path):
+        read_threads.append(threading.get_ident())
+        return real_read(path)
+
+    def completed(*args):
+        completion_threads.append(threading.get_ident())
+        return real_completed(*args)
+
+    def after(delay, callback=None, *args):
+        after_calls.append((threading.get_ident(), delay, getattr(callback, "__name__", "")))
+        return real_after(delay, callback, *args)
+
+    def redraw():
+        redraws.append(threading.get_ident())
+        return real_redraw()
+
+    monkeypatch.setattr(gui, "read_intermediate", read)
+    monkeypatch.setattr(app, "_prepared", completed)
+    monkeypatch.setattr(root, "after", after)
+    monkeypatch.setattr(root, "update_idletasks", redraw)
+    monkeypatch.setattr(
+        root, "report_callback_exception", lambda *args: callback_errors.append(args)
+    )
+    app.prepare_button.invoke()
+    _wait_for_idle(root, app)
+    assert target.exists()
+    assert not callback_errors
+    assert read_threads and all(t != main_thread for t in read_threads)
+    assert completion_threads == [main_thread]
+    assert all(t == main_thread for t, _, _ in after_calls)
+    assert (main_thread, 0, "_finish_job") in after_calls
+    assert redraws and all(t == main_thread for t in redraws)
+    assert app._poll_id is None
+    assert app.review_result.title.cget("text") == "Excel preparado"
+    assert app.prepared_path.get() == app.intermediate.get() == str(target)
+    assert "Preparando o Excel" not in app.status.get()
+    assert not app.progress.winfo_ismapped()
+    assert not app.activity_label.winfo_ismapped()
+    assert len(app.review_result.metrics_frame.winfo_children()) == 6
+    assert app.review_result.metric_summary == (
+        "operações: 2 · prontas: 0 · pendentes: 2 · composições encontradas: 1 · "
+        "títulos envolvidos: 2 · composições aguardando aprovação: 1"
+    )
+    text = app.review_result.issue_text.get("1.0", "end")
+    assert "── Preenchimentos comprovados (automáticos) ──" in text
+    assert "── Sugestões aguardando confirmação ──" in text
+    assert "── Pendências sem solução automática ──" in text
+    assert "PRO_RATA_VALOR_PRESENTE_COMPOSICAO" in text
+    for widget in (app.open_excel_button, app.continue_generate_button, app.prepared_files):
+        assert widget.winfo_ismapped()
+    for button in (app.prepare_button, app.prepare_again_button,
+                   app.open_excel_button, app.continue_generate_button):
+        assert str(button.cget("state")) == "normal"
+    loaded = real_read(target)
+    assert all(r.values["COMPOSICAO_APROVADA"] in (None, "") for r in loaded.rows)
+
+
+def test_prepared_summary_survives_blank_pendencias_after_nominal_suggestion(
+    gui_application,
+):
+    """Regression for the V1-7 pro-rata suggestion: once it clears a
+    composition row's only pendency, PENDENCIAS round-trips through openpyxl
+    as None (not "") for a still-unapproved row - explain_pending() must not
+    raise TypeError, and the full summary panel must render regardless."""
+    root, app, _ = gui_application
+
+    class _FakeRow:
+        def __init__(self, values):
+            self.values = values
+
+    rows = [
+        _FakeRow(
+            {
+                "ID_GRUPO": "F0001-B0001-G0001",
+                "NOME_CEDENTE_PFMI": "PRINCIPAL COMPOSICAO",
+                "STATUS": "OK",
+                "PENDENCIAS": None,  # blank cell round-tripped from Excel
+                "INCLUIR_CNAB": "NAO",
+                "COMPOSICAO_ID": "COMP1",
+                "COMPOSICAO_APROVADA": None,
+                "PREENCHIMENTOS_AUTOMATICOS": (
+                    '[{"campo": "VL_NOMINAL", "valor_sugerido": 123.45, '
+                    '"regra": "PRO_RATA_VALOR_PRESENTE_COMPOSICAO", '
+                    '"exige_aprovacao_humana": true}]'
+                ),
+            }
+        ),
+        _FakeRow(
+            {
+                "ID_GRUPO": "F0001-B0001-G0002",
+                "NOME_CEDENTE_PFMI": "SATELITE COMPOSICAO",
+                "STATUS": "DIVERGENCIA_NOME",
+                "PENDENCIAS": "DIVERGENCIA_NOME",
+                "INCLUIR_CNAB": "NAO",
+                "COMPOSICAO_ID": "COMP1",
+                "COMPOSICAO_APROVADA": None,
+                "PREENCHIMENTOS_AUTOMATICOS": "",
+            }
+        ),
+    ]
+    result = PreparationResult(
+        output_path=Path("fake.xlsx"),
+        row_count=2,
+        selected_count=0,
+        warning_count=0,
+        warnings=(),
+        payment_count=2,
+        group_count=2,
+        related_suggestions=(),
+        compositions=(
+            {
+                "composicao_id": "COMP1",
+                "estado": "PROPOSTA",
+                "participantes": "PRINCIPAL COMPOSICAO + SATELITE COMPOSICAO",
+                "motivo": "soma exata",
+                "total_pfmi": Decimal("123.45"),
+                "total_analitico": Decimal("123.45"),
+                "diferenca": Decimal("0.00"),
+                "nominal_analitico": Decimal("123.45"),
+                "component_ids": ("F0001-B0001-G0001", "F0001-B0001-G0002"),
+            },
+        ),
+    )
+    review = gui._PreparedReview(result=result, rows=rows)
+    app._job_step = 2
+    app._job_completed = lambda value: app._prepared(value, 1, "sig")
+    # Called synchronously (no root.after in between), so a bug here raises
+    # straight into the test instead of only reaching Tk's error hook.
+    app._finish_job(True, review)
+    assert app.review_result.title.cget("text") == "Excel preparado"
+    assert len(app.review_result.metrics_frame.winfo_children()) == 6
+    text = app.review_result.issue_text.get("1.0", "end")
+    assert "── Preenchimentos comprovados (automáticos) ──" in text
+    assert "── Sugestões aguardando confirmação ──" in text
+    assert "── Pendências sem solução automática ──" in text
+    assert "Este item precisa de conferência manual antes de continuar." in text
+    assert not app.is_busy
+    assert app._poll_id is None
+    assert str(app.prepare_button.cget("state")) == "normal"
+
+
+def test_explain_pending_never_raises_on_blank_pendencias():
+    assert explain_pending(None) == "Este item precisa de conferência manual antes de continuar."
+    assert explain_pending("") == "Este item precisa de conferência manual antes de continuar."
+
+
+@pytest.mark.parametrize("failure_stage", ["read", "callback"])
+def test_saved_excel_summary_error_recovers_and_allows_next_preparation(
+    tmp_path, monkeypatch, gui_application, failure_stage,
+):
+    root, app, _ = gui_application
+    _setup_sources(root, app, monkeypatch, tmp_path)
+    target = tmp_path / "saved.xlsx"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **_: str(target))
+    callback_errors = []
+    monkeypatch.setattr(
+        root, "report_callback_exception", lambda *args: callback_errors.append(args)
+    )
+    real_read, real_completed = gui.read_intermediate, app._prepared
+
+    def fail(*_args):
+        raise KeyError("fonte")
+
+    if failure_stage == "read":
+        monkeypatch.setattr(gui, "read_intermediate", fail)
+    else:
+        monkeypatch.setattr(app, "_prepared", fail)
+    app.prepare_button.invoke()
+    _wait_for_idle(root, app)
+    assert target.exists()
+    assert not callback_errors
+    assert app.review_result.title.cget("text") == "Excel salvo; resumo indisponível"
+    assert app.prepared_path.get() == str(target)
+    assert not app.is_busy
+    assert app._poll_id is None
+    assert not app.progress.winfo_manager()
+    assert str(app.prepare_again_button.cget("state")) == "normal"
+    assert str(app.open_excel_button.cget("state")) == "normal"
+    monkeypatch.setattr(gui, "read_intermediate", real_read)
+    monkeypatch.setattr(app, "_prepared", real_completed)
+    next_target = tmp_path / "next.xlsx"
+    monkeypatch.setattr(gui.filedialog, "asksaveasfilename", lambda **_: str(next_target))
+    app.prepare_again_button.invoke()
+    _wait_for_idle(root, app)
+    assert target.exists() and next_target.exists()
+    assert not callback_errors
+    assert app.review_result.title.cget("text") == "Excel preparado"
+    assert len(app.review_result.metrics_frame.winfo_children()) == 6
 
 
 def test_all_issues_remain_readable_and_unknown_guidance_is_neutral(

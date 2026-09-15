@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import queue
 import subprocess
@@ -34,6 +35,76 @@ class _PfmiRow:
     comissao_texto: str = ""
     cessao_ja_configurada: bool = False
     emissao_nova_cessao_texto: str = ""
+
+
+@dataclass
+class _PreparedReview:
+    result: object
+    rows: tuple
+    error: Exception | None = None
+
+
+def _prepare_review(*args, **kwargs):
+    """Read the saved review data in the worker; this function never uses Tk."""
+    result = prepare_workbook(*args, **kwargs)
+    try:
+        rows = tuple(read_intermediate(result.output_path).rows)
+    except Exception as exc:
+        # The workbook was saved: a summary failure must not claim otherwise.
+        return _PreparedReview(result, (), exc)
+    return _PreparedReview(result, rows)
+
+
+def _parse_preenchimentos_automaticos(raw: object) -> list[dict]:
+    """PREENCHIMENTOS_AUTOMATICOS is a JSON audit trail written at prepare
+    time (matching.py); malformed/empty content never breaks the summary."""
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return [item for item in parsed if isinstance(item, dict)] if isinstance(parsed, list) else []
+
+
+def _composition_message(c: dict) -> str:
+    total_pfmi = money(c["total_pfmi"]) if c["total_pfmi"] is not None else "indisponível"
+    total_analitico = (
+        money(c["total_analitico"]) if c["total_analitico"] is not None else "indisponível"
+    )
+    diferenca = money(c["diferenca"]) if c["diferenca"] is not None else "indisponível"
+    nominal = (
+        money(c["nominal_analitico"]) if c["nominal_analitico"] is not None else "indisponível"
+    )
+    if c["estado"] == "PROPOSTA":
+        prefixo = "Composição encontrada — confira antes de aprovar"
+        rodape = (
+            "Esta sugestão não confirma identidade: confira o instrumento e aprove "
+            "explicitamente em COMPOSICAO_APROVADA no Excel; enquanto isso os títulos "
+            "permanecem pendentes."
+        )
+    elif c["estado"] == "BLOQUEADA_CREDITO_NAO_LOCALIZADO":
+        prefixo = "Composição bloqueada"
+        rodape = (
+            "Não localizamos o crédito automaticamente. Veja os candidatos em "
+            "COMPOSICAO_CANDIDATOS (nome, documento mascarado, valor e linha) e, se "
+            "você já conferiu o instrumento, informe a aba e a linha exatas do "
+            "Analítico em COMPOSICAO_SELECAO_MANUAL_ABA/COMPOSICAO_SELECAO_MANUAL_LINHA "
+            "(iguais em todas as linhas da composição) no Excel; só é aceito se fechar "
+            "exatamente com a soma dos componentes."
+        )
+    else:
+        prefixo = "Composição bloqueada"
+        rodape = (
+            "Esta sugestão não confirma identidade: confira o instrumento e aprove "
+            "explicitamente em COMPOSICAO_APROVADA no Excel; enquanto isso os títulos "
+            "permanecem pendentes."
+        )
+    return (
+        f"{prefixo}: {c['participantes']} · total PFMI {total_pfmi} · "
+        f"total Analítico {total_analitico} · diferença {diferenca} · "
+        f"nominal do crédito {nominal} · motivo: {c['motivo']}. {rodape}"
+    )
 
 
 class Application:
@@ -132,6 +203,9 @@ class Application:
         )
         self.direct_excel_button.pack(side="right")
         self.direct_excel_button.configure(style="Header.TButton")
+        self.new_batch_button = self._button(header, "Novo Lote", self._new_batch)
+        self.new_batch_button.pack(side="right", padx=(0, 8))
+        self.new_batch_button.configure(style="Header.TButton")
         navigation = ttk.Frame(self.container, style="Shell.TFrame", padding=(24, 12))
         navigation.pack(fill="x")
         self.step_buttons = []
@@ -214,6 +288,9 @@ class Application:
             lambda: self._open_local(self.generated_path.get(), 3, folder=True),
             primary=True,
         )
+        self.new_batch_after_generate_button = self._button(
+            self.footers[3], "Novo Lote", self._new_batch
+        )
         self.results = {2: self.review_result, 3: self.generation_result}
         self.review_result.show("Pronto para preparar", "Escolha onde salvar o Excel ao preparar.")
         self._reset_generation()
@@ -234,8 +311,12 @@ class Application:
         ttk.Label(bar, text="PFMIs do lote", style="Section.TLabel").pack(side="left")
         self.pfmi_count_label = ttk.Label(bar, textvariable=self.pfmi_count)
         self.pfmi_count_label.pack(side="left", padx=12)
-        self.add_pfmi_button = self._button(bar, "Adicionar PFMIs", self._add_pfmis)
+        self.add_pfmi_button = self._button(bar, "Selecionar PFMIs", self._add_pfmis)
         self.add_pfmi_button.pack(side="right")
+        self.add_more_pfmi_button = self._button(
+            bar, "Adicionar mais PFMIs", lambda: self._add_pfmis(replace=False)
+        )
+        self.add_more_pfmi_button.pack(side="right", padx=(0, 8))
         table = ttk.Frame(file_card)
         table.pack(fill="x")
         table.columnconfigure(0, weight=1)
@@ -522,6 +603,7 @@ class Application:
         self.generated_path.set("")
         self.generated_files.pack_forget()
         self.open_generated_folder_button.pack_forget()
+        self.new_batch_after_generate_button.pack_forget()
         self.generate_button.configure(text="Validar e gerar TXT", style="Primary.TButton")
         self.generate_button.pack(side="right")
         self.generation_result.show(
@@ -529,6 +611,54 @@ class Application:
             "Revise e salve os campos finais antes de clicar em Validar e gerar TXT.",
         )
         self.opening_generation_notice.configure(text="")
+
+    def _reset_batch_state(self):
+        """Start a brand-new batch: clear every PFMI, source, date/sequence
+        and prepared/generated result, so residual state from a previous
+        test (e.g. a different liquidation date) never mixes into the next
+        one. Never called implicitly by ordinary back/forward navigation -
+        only by an explicit "Novo Lote" action - so reviewing or tweaking
+        the current batch's configuration is never destructive."""
+        if self.is_busy:
+            return
+        for item_id in list(self.pfmi_tree.get_children()):
+            self.pfmi_tree.delete(item_id)
+        self._pfmi_rows.clear()
+        self._next_pfmi_id = 1
+        self._clear_pfmi_editor()
+        self._refresh_pfmi_tree()
+        self.analytic.set("")
+        self.due.set("")
+        self.liquidation.set("")
+        self.sequence.set("")
+        self._prepared_signature = None
+        self.prepared_path.set("")
+        self.intermediate.set("")
+        self.prepared_files.pack_forget()
+        self.prepare_button.pack(side="right")
+        self.open_excel_button.pack_forget()
+        self.continue_generate_button.pack_forget()
+        self.summary_label.pack(fill="x", anchor="w", pady=(0, 10), before=self.review_result)
+        self.review_result.show(
+            "Pronto para preparar", "Escolha onde salvar o Excel ao preparar."
+        )
+        self._reset_generation()
+        self._drain_job_queue()
+        self._configuration_changed()
+        self._sync_status()
+
+    def _drain_job_queue(self):
+        # Only reachable when not busy (see the is_busy guard above), so the
+        # worker never puts anything new while this runs; defensive only.
+        while True:
+            try:
+                self._job_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _new_batch(self):
+        self._reset_batch_state()
+        self.show_step(1)
 
     def _intermediate_changed(self, *_args):
         self._reset_generation()
@@ -543,14 +673,27 @@ class Application:
         if chosen:
             variable.set(chosen)
 
-    def _add_pfmis(self):
+    def _add_pfmis(self, *, replace=True):
         if self.is_busy:
             return
         chosen = filedialog.askopenfilenames(
             parent=self.root,
-            title="Adicionar uma ou mais PFMIs",
+            title="Selecionar PFMIs" if replace else "Adicionar mais PFMIs",
             filetypes=[("Excel", "*.xlsx"), ("Todos", "*.*")],
         )
+        if not chosen:
+            return
+        if replace and self._pfmi_rows:
+            # Default action starts a fresh selection instead of silently
+            # accumulating files from a previous, possibly unrelated batch
+            # (e.g. mixing PFMIs from two different liquidation dates).
+            # "Adicionar mais PFMIs" is the explicit, deliberate way to
+            # combine several files into the same batch (e.g. Normal +
+            # Cessão da Cessão for the same test).
+            for item_id in list(self.pfmi_tree.get_children()):
+                self.pfmi_tree.delete(item_id)
+            self._pfmi_rows.clear()
+            self._editing_pfmi_id = None
         last_id = None
         for path in chosen:
             item_id = f"PFMI_{self._next_pfmi_id:04d}"
@@ -768,29 +911,63 @@ class Application:
         self._start_job(
             2,
             "Preparando o Excel. Aguarde a conclusão.",
-            lambda: prepare_workbook(*args, **kwargs),
+            lambda: _prepare_review(*args, **kwargs),
             lambda result: self._prepared(result, len(pfmis), signature),
         )
 
     def _prepared(self, result, pfmi_count, signature):
+        review = result if isinstance(result, _PreparedReview) else None
+        if review is not None:
+            result = review.result
         self._prepared_signature = signature
         self.prepared_path.set(str(result.output_path))
         self.intermediate.set(str(result.output_path))
         self._configuration_changed()
         groups: dict[str, dict] = {}
-        try:
-            loaded_rows = read_intermediate(result.output_path).rows
-        except UserFacingError:
-            loaded_rows = ()
+        preenchimentos_comprovados: list[str] = []
+        sugestoes_aguardando: list[str] = []
+        if review is not None:
+            if review.error is not None:
+                raise review.error
+            loaded_rows = review.rows
+        else:
+            # Direct calls used by layout previews; real jobs already carry the rows.
+            try:
+                loaded_rows = read_intermediate(result.output_path).rows
+            except UserFacingError:
+                loaded_rows = ()
         for row in loaded_rows:
             v = row.values
             g = groups.setdefault(
                 v["ID_GRUPO"], {"credor": v["NOME_CEDENTE_PFMI"], "ok": False, "pendencias": ""}
             )
-            if v["STATUS"] == "OK":
+            if (
+                v["STATUS"] == "OK" and v.get("INCLUIR_CNAB") == "SIM"
+                and (not v.get("COMPOSICAO_ID") or v.get("COMPOSICAO_APROVADA") == "SIM")
+            ):
                 g["ok"] = True
             elif not g["ok"]:
-                g["pendencias"] = v["PENDENCIAS"]
+                # A blank PENDENCIAS cell round-trips through openpyxl as
+                # None, not "" - reachable now that a composition's only
+                # pendency can be cleared by the nominal suggestion while the
+                # row still isn't approved/included.
+                g["pendencias"] = v["PENDENCIAS"] or ""
+            preenchimentos_linha = _parse_preenchimentos_automaticos(
+                v.get("PREENCHIMENTOS_AUTOMATICOS")
+            )
+            for preenchimento in preenchimentos_linha:
+                campo = preenchimento.get("campo", "Campo não informado")
+                linha = (
+                    f"{v['NOME_CEDENTE_PFMI']}: {campo} = "
+                    f"{preenchimento.get('valor_sugerido', '')} "
+                    f"({preenchimento.get('regra', 'Regra não informada')}"
+                )
+                source = preenchimento.get("fonte")
+                linha += f", fonte: {source})" if source else ")"
+                if preenchimento.get("exige_aprovacao_humana"):
+                    sugestoes_aguardando.append(linha)
+                else:
+                    preenchimentos_comprovados.append(linha)
         total = len(groups)
         prontas = sum(1 for g in groups.values() if g["ok"])
         pendentes = [g for g in groups.values() if not g["ok"]]
@@ -805,20 +982,53 @@ class Application:
             + ", ".join(c["referencia"] for c in s["creditos_encontrados"])
             for s in result.related_suggestions
         )
+        composition_lines = tuple(
+            _composition_message(c) for c in result.compositions
+        )
+        aguardando = sum(1 for c in result.compositions if c["estado"] == "PROPOSTA")
+        titulos_envolvidos = sum(len(c["component_ids"]) for c in result.compositions)
+        # Três blocos separados visualmente (regra "Preenchimentos comprovados"
+        # vs "Decisões que exigem conferência" vs pendências sem solução
+        # automática) dentro do mesmo painel de texto já existente - nenhuma
+        # etapa nova, só a reorganização do resumo pós-preparo.
+        sections = ["── Preenchimentos comprovados (automáticos) ──"]
+        sections.extend(preenchimentos_comprovados or ["Nenhum preenchimento nesta categoria."])
+        sugestoes = tuple(sugestoes_aguardando) + suggestion_lines + composition_lines
+        sections.append("── Sugestões aguardando confirmação ──")
+        sections.extend(sugestoes or ["Nenhuma sugestão aguardando confirmação."])
+        sections.append("── Pendências sem solução automática ──")
+        sections.extend(pending_lines or ["Nenhuma pendência nesta categoria."])
         self.review_result.show(
             "Excel preparado",
             body,
             kind="success" if not pendentes else "warning",
-            issues=pending_lines + suggestion_lines,
+            issues=tuple(sections),
             details=result.warnings,
             metrics=(
                 ("operações", total),
                 ("prontas", prontas),
                 ("pendentes", len(pendentes)),
+                ("composições encontradas", len(result.compositions)),
+                ("títulos envolvidos", titulos_envolvidos),
+                ("composições aguardando aprovação", aguardando),
             ),
         )
+        # Six cards in two rows stay readable at the supported minimum width.
+        for column in range(6):
+            self.review_result.metrics_frame.columnconfigure(
+                column, weight=1 if column < 3 else 0, uniform="metrics" if column < 3 else ""
+            )
+        for index, block in enumerate(self.review_result.metrics_frame.winfo_children()):
+            block.grid_configure(row=index // 3, column=index % 3, pady=(0, 8))
+        self._show_prepared_files()
+        self.root.update_idletasks()
+
+    def _show_prepared_files(self):
         self.summary_label.pack_forget()
-        self.prepared_files.pack(fill="x", after=self.review_result.metrics_frame)
+        anchor = self.review_result.metrics_frame
+        if not anchor.winfo_manager():
+            anchor = self.review_result.body
+        self.prepared_files.pack(fill="x", after=anchor)
         self.prepare_button.pack_forget()
         self.open_excel_button.pack(side="right")
         self.continue_generate_button.pack(side="right", padx=(0, 8))
@@ -845,24 +1055,34 @@ class Application:
         if not destination:
             return
         source = self.intermediate.get()
+        analytic_path = self.analytic.get().strip() or None
         self._reset_generation()
         self._start_job(
             3,
             "Validando o Excel e gerando o TXT. Aguarde.",
             lambda: generate_cnab(
-                source, output_path=destination, lawyer_rules=load_lawyer_rules()
+                source,
+                output_path=destination,
+                lawyer_rules=load_lawyer_rules(),
+                analytic_path=analytic_path,
             ),
             self._generated,
         )
 
     def _generated(self, result):
         self.generated_path.set(str(result.output_path))
+        composition_lines = tuple(
+            "Composição gerada — confira antes de enviar: "
+            + "; ".join(f"{c['nome']} = R$ {money(c['vl_nominal'])}" for c in comp["componentes"])
+            + f" · total nominal do grupo: R$ {money(comp['total_nominal'])}"
+            for comp in result.compositions
+        )
         self.generation_result.show(
             "TXT salvo com sucesso",
             f"Sequência: {result.first_sequence}–{result.last_sequence} · "
             f"Avisos: {result.warning_count}",
             kind="success",
-            issues=tuple(explain_issue(v) for v in result.warnings),
+            issues=tuple(explain_issue(v) for v in result.warnings) + composition_lines,
             details=result.warnings,
             metrics=(
                 ("Títulos", result.detail_count),
@@ -875,6 +1095,7 @@ class Application:
         )
         self.generate_button.pack_forget()
         self.open_generated_folder_button.pack(side="right")
+        self.new_batch_after_generate_button.pack(side="right", padx=(0, 8))
         self.generate_button.configure(text="Gerar outro TXT", style="TButton")
         self.generate_button.pack(side="right", padx=(0, 8))
         self.body.canvas.yview_moveto(0)
@@ -911,15 +1132,37 @@ class Application:
         except queue.Empty:
             self._poll_id = self.root.after(40, self._poll_job)
             return
+        # The queue is the worker's only contact with the UI. Even after() is
+        # scheduled on the Tk thread, so no worker relies on Tcl cross-thread calls.
+        self._poll_id = self.root.after(0, self._finish_job, success, value)
+
+    def _finish_job(self, success, value):
+        self._poll_id = None
         try:
             if success:
                 self._job_completed(value)
             else:
                 self._show_error(value, self._job_step)
+        except Exception as exc:
+            if success and self._job_step == 2:
+                result = value.result if isinstance(value, _PreparedReview) else value
+                self.prepared_path.set(str(result.output_path))
+                self.intermediate.set(str(result.output_path))
+                self.review_result.show(
+                    "Excel salvo; resumo indisponível",
+                    "O arquivo foi salvo, mas não foi possível apresentar o resumo. "
+                    "Abra o Excel para revisar as informações.",
+                    kind="warning",
+                    details=(f"Falha ao apresentar resumo: {type(exc).__name__}",),
+                )
+                self._show_prepared_files()
+            else:
+                self._show_error(exc, self._job_step)
         finally:
             self._busy(False)
             self._sync_status()
             self.body.reveal(self.results[self._job_step].title, align_top=True)
+            self.root.update_idletasks()
 
     def _busy(self, busy, text=None):
         self.is_busy = busy

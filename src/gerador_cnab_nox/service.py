@@ -126,6 +126,7 @@ def prepare_workbook(
         batch.payment_count,
         batch.group_count,
         tuple(batch.related_suggestions),
+        tuple(batch.compositions),
     )
 
 
@@ -135,10 +136,23 @@ def generate_cnab(
     output_path: str | Path | None = None,
     log_directory: str | Path | None = None,
     lawyer_rules: dict[str, tuple[str, ...]] | None = None,
+    analytic_path: str | Path | None = None,
 ) -> GenerationResult:
     source = Path(intermediate_path)
     loaded = read_intermediate(source)
-    batch = validate_for_generation(loaded, lawyer_rules or {})
+    # analytic_path é opcional e só serve para conferir uma SELECAO_MANUAL_
+    # DOCUMENTO já aprovada pelo operador (ver validation.py); nenhuma
+    # correspondência automática nova é feita a partir dele. A geração nunca
+    # depende das fontes originais ainda existirem: se o Analítico não puder
+    # ser lido, a seleção manual (se alguma linha precisar) simplesmente
+    # continua bloqueada com uma pendência clara, sem impedir o restante.
+    analytic = None
+    if analytic_path:
+        try:
+            analytic = read_analytic(analytic_path)
+        except Exception:
+            analytic = None
+    batch = validate_for_generation(loaded, lawyer_rules or {}, analytic)
     destination = (
         Path(output_path) if output_path else _unique_output(Path.cwd(), "cnab_nox", ".txt")
     )
@@ -176,7 +190,33 @@ def generate_cnab(
         last_sequence=last_sequence,
         warning_count=len(result_warnings),
         warnings=tuple(result_warnings),
+        compositions=_summarize_generated_compositions(batch.rows),
     )
+
+
+def _summarize_generated_compositions(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
+    # Somente para conferência humana: nenhum valor aqui é calculado, somado
+    # com arredondamento ou usado para decidir seleção - apenas reapresenta o
+    # que o operador digitou em cada componente já gerado.
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        composicao_id = row.get("COMPOSICAO_ID")
+        if composicao_id:
+            grouped.setdefault(composicao_id, []).append(row)
+    summaries = []
+    for composicao_id, group_rows in grouped.items():
+        componentes = tuple(
+            {"nome": r["NOME_CEDENTE"], "vl_nominal": r["VL_NOMINAL"]} for r in group_rows
+        )
+        total_nominal = sum((r["VL_NOMINAL"] for r in group_rows), Decimal("0.00"))
+        summaries.append(
+            {
+                "composicao_id": composicao_id,
+                "componentes": componentes,
+                "total_nominal": total_nominal,
+            }
+        )
+    return tuple(summaries)
 
 
 def _optional_date(value: Any):

@@ -16,6 +16,12 @@ _PENDING_MESSAGES = (
         "Não encontramos um crédito individual com o mesmo valor. Confira o instrumento.",
     ),
     (
+        "COMPOSICAO_BLOQUEADA_SELECAO_MANUAL",
+        "A composição não fechou automaticamente. Confira o instrumento e, se estiver "
+        "correto, informe a aba/linha do Analítico em COMPOSICAO_SELECAO_MANUAL_ABA/"
+        "COMPOSICAO_SELECAO_MANUAL_LINHA.",
+    ),
+    (
         "MULTIPLOS_CREDITOS_PRINCIPAIS",
         "Encontramos mais de um crédito. Selecione os créditos corretos.",
     ),
@@ -33,7 +39,9 @@ _PENDING_MESSAGES = (
     ),
     (
         "DIVERGENCIA_VALOR",
-        "Os valores não coincidem exatamente. Confira o grupo antes de continuar.",
+        "O valor do Analítico e o valor da PFMI não coincidem exatamente. Confira o "
+        "instrumento; se o crédito estiver correto, você pode aprovar o uso do valor da "
+        "PFMI em DIVERGENCIA_VALOR_APROVADA, com uma justificativa.",
     ),
     ("DIVERGENCIA_NOME", "O nome no sistema é diferente do nome na PFMI. Confira e corrija."),
     ("DOC_CEDENTE_INVALIDO", "O documento do cedente está inválido. Confira e corrija."),
@@ -54,11 +62,47 @@ _PENDING_MESSAGES = (
 
 
 def explain_pending(codes: str) -> str:
-    """Plain-language message for a pending row/group, from its PENDENCIAS codes."""
+    """Plain-language message for a pending row/group, from its PENDENCIAS codes.
+
+    An openpyxl round trip reads a blank PENDENCIAS cell back as None (not
+    ""), which a group with no other issue can now reach in practice since
+    the composition nominal suggestion can clear the row's only pendency.
+    """
+    codes = codes or ""
     for code, message in _PENDING_MESSAGES:
         if code in codes:
             return message
     return "Este item precisa de conferência manual antes de continuar."
+
+
+# Uma instrução objetiva por linha, priorizada (nunca a lista inteira de
+# flags empilhada) - o oposto de explain_pending acima, que descreve o
+# problema; esta diz que campo preencher/aprovar e onde. Deliberadamente uma
+# função pura e independente, sem alterar explain_pending nem seus chamadores
+# já testados no restante da GUI.
+_ACTION_INSTRUCTIONS = (
+    ("COMPOSICAO_BLOQUEADA_SELECAO_MANUAL", "Indicar Aba/Linha do Analítico (Cols CM/CN)."),
+    ("CREDITO_NAO_LOCALIZADO", "Indicar Aba/Linha do Analítico (Cols CM/CN)."),
+    ("DIVERGENCIA_VALOR", "Aprovar diferença de centavos com justificativa (Cols CP/CQ)."),
+    ("DIVERGENCIA_NOME", "Validar divergência de grafia (APROVADO=SIM)."),
+)
+
+
+def format_action_instruction(pendencias: set[str], composicao_estado: str = "") -> str:
+    """One prioritized, objective instruction for the operator from a row's
+    PENDENCIAS codes and its COMPOSICAO_ESTADO - never every flag stacked
+    together. `composicao_estado` maps a found-but-unapproved composition
+    (COMPOSICAO_ESTADO=="PROPOSTA") to its own instruction, since that state
+    is not itself one of the PENDENCIAS codes."""
+    codes = set(pendencias or ())
+    for code, instruction in _ACTION_INSTRUCTIONS:
+        if code in codes:
+            return instruction
+    if composicao_estado == "PROPOSTA":
+        return "Validar instrumento e marcar COMPOSICAO_APROVADA=SIM."
+    if codes:
+        return "Este item precisa de conferência manual antes de continuar."
+    return ""
 
 
 def explain_issue(message: str) -> str:
@@ -98,10 +142,36 @@ def explain_issue(message: str) -> str:
         action = "Corrija a data de liquidação na aba RESUMO e salve o Excel."
     elif "PRIMEIRA_SEQUENCIA" in message or "Faixa de sequência" in message:
         action = "Confira a primeira sequência na aba RESUMO e salve o Excel."
+    elif "DIVERGENCIA_VALOR_JUSTIFICATIVA" in message:
+        action = (
+            "DIVERGENCIA_VALOR_JUSTIFICATIVA e DIVERGENCIA_VALOR_APROVADA=SIM andam juntas: "
+            "preencha as duas, ou nenhuma das duas, na aba CREDITOS."
+        )
+    elif "DIVERGENCIA_VALOR" in message and "APROVADA" in message:
+        action = (
+            "A composição só pode ser aprovada quando o principal está identificado e, se "
+            "houver divergência de valor, ela foi aprovada com justificativa em todas as "
+            "linhas da composição."
+        )
+    elif "SELECAO_MANUAL_DOCUMENTO não fecha exatamente" in message:
+        action = (
+            "O documento identifica o crédito certo, mas o valor do Analítico diverge do "
+            "total da PFMI. Confira o instrumento; se estiver correto, aprove o uso do valor "
+            "da PFMI em DIVERGENCIA_VALOR_APROVADA, com justificativa."
+        )
+    elif "registro selecionado não fecha exatamente" in message:
+        action = (
+            "O registro escolhido para a composição diverge do total da PFMI. Confira o "
+            "instrumento; se estiver correto, aprove o uso do valor da PFMI em "
+            "DIVERGENCIA_VALOR_APROVADA, com justificativa, igual em todas as linhas."
+        )
     elif "DIVERGENCIA_VALOR" in message:
         action = (
-            "Os valores não fecham com a PFMI. Confira o grupo e os valores finais; "
-            "diferenças de centavos também impedem o TXT."
+            "O valor do Analítico e o valor da PFMI não coincidem exatamente - nem "
+            "diferenças de centavos são ignoradas automaticamente. Confira o instrumento; "
+            "se o crédito estiver correto, aprove o uso do valor da PFMI em "
+            "DIVERGENCIA_VALOR_APROVADA, explicando o motivo em "
+            "DIVERGENCIA_VALOR_JUSTIFICATIVA."
         )
     elif "DIVERGENCIA_NOME" in message:
         action = (

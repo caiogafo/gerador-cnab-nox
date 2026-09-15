@@ -16,10 +16,17 @@ from openpyxl.styles import Alignment, Font, PatternFill, Protection
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from .errors import InputFileError
-from .models import CONTROL_FIELDS, FINAL_FIELDS, IMMUTABLE_FIELDS, PreparedBatch, PreparedRow
+from .models import (
+    CONTROL_FIELDS,
+    EDITABLE_CONTROLS,
+    FINAL_FIELDS,
+    IMMUTABLE_FIELDS,
+    PreparedBatch,
+    PreparedRow,
+)
 from .normalize import excel_safe
 
-SCHEMA_VERSION = "CNAB-NOX-V1-2"
+SCHEMA_VERSION = "CNAB-NOX-V1-7"
 # Keep editable finals adjacent to the review decisions; provenance remains visible.
 CREDIT_HEADERS = tuple(
     dict.fromkeys(
@@ -98,7 +105,7 @@ def write_intermediate(batch: PreparedBatch, output_path: str | Path) -> Path:
         for cell in row:
             field = credits.cell(1, cell.column).value
             cell.protection = Protection(
-                locked=field not in {*FINAL_FIELDS, "INCLUIR_CNAB", "APROVADO"}
+                locked=field not in {*FINAL_FIELDS, *EDITABLE_CONTROLS}
             )
     summary["B3"].protection = Protection(locked=False)
     summary["B4"].protection = Protection(locked=False)
@@ -277,8 +284,16 @@ def _write_credits(sheet, rows: list[PreparedRow]) -> None:
     sheet.auto_filter.ref = sheet.dimensions
     yes_no = DataValidation(type="list", formula1='"SIM,NAO"', allow_blank=True)
     approved = DataValidation(type="list", formula1='"SIM,NAO"', allow_blank=True)
+    composicao_approved = DataValidation(type="list", formula1='"SIM,NAO"', allow_blank=True)
+    selecao_manual_approved = DataValidation(type="list", formula1='"SIM,NAO"', allow_blank=True)
+    # Só "SIM": não existe um "NAO" explícito para aprovar divergência de
+    # valor - o padrão (vazio) já é o bloqueio; ver validation.py.
+    divergencia_valor_approved = DataValidation(type="list", formula1='"SIM"', allow_blank=True)
     sheet.add_data_validation(yes_no)
     sheet.add_data_validation(approved)
+    sheet.add_data_validation(composicao_approved)
+    sheet.add_data_validation(selecao_manual_approved)
+    sheet.add_data_validation(divergencia_valor_approved)
     header_map = {cell.value: cell.column for cell in sheet[1]}
     if sheet.max_row >= 2:
         yes_no.add(
@@ -288,6 +303,19 @@ def _write_credits(sheet, rows: list[PreparedRow]) -> None:
         approved.add(
             f"{sheet.cell(1, header_map['APROVADO']).column_letter}2:"
             f"{sheet.cell(1, header_map['APROVADO']).column_letter}{sheet.max_row}"
+        )
+        composicao_approved.add(
+            f"{sheet.cell(1, header_map['COMPOSICAO_APROVADA']).column_letter}2:"
+            f"{sheet.cell(1, header_map['COMPOSICAO_APROVADA']).column_letter}{sheet.max_row}"
+        )
+        selecao_manual_approved.add(
+            f"{sheet.cell(1, header_map['SELECAO_MANUAL_APROVADA']).column_letter}2:"
+            f"{sheet.cell(1, header_map['SELECAO_MANUAL_APROVADA']).column_letter}{sheet.max_row}"
+        )
+        divergencia_valor_col = sheet.cell(1, header_map["DIVERGENCIA_VALOR_APROVADA"])
+        divergencia_valor_approved.add(
+            f"{divergencia_valor_col.column_letter}2:"
+            f"{divergencia_valor_col.column_letter}{sheet.max_row}"
         )
         status_letter = sheet.cell(1, header_map["STATUS"]).column_letter
         range_ref = f"{status_letter}2:{status_letter}{sheet.max_row}"
@@ -310,6 +338,14 @@ def _write_credits(sheet, rows: list[PreparedRow]) -> None:
         "AQUISICAO_ESPERADA",
         "DIFERENCA_PRESENTE",
         "DIFERENCA_NOMINAL",
+        "COMPOSICAO_TOTAL_PFMI",
+        "COMPOSICAO_TOTAL_ANALITICO",
+        "COMPOSICAO_DIFERENCA_PRESENTE",
+        "COMPOSICAO_NOMINAL_ANALITICO",
+        "VL_NOMINAL_SUGERIDO",
+        "DIVERGENCIA_VALOR_ANALITICO",
+        "DIVERGENCIA_VALOR_PFMI",
+        "DIVERGENCIA_VALOR_DIFERENCA",
     ):
         column = header_map[field]
         for cell in sheet.iter_cols(min_col=column, max_col=column, min_row=2):
@@ -333,11 +369,16 @@ def _write_credits(sheet, rows: list[PreparedRow]) -> None:
         "DOC_BENEFICIARIO_PFMI": 28,
         "PENDENCIAS_FONTE_PFMI": 38,
         "ORIGENS_CNPJ_CONEXCRED": 65,
+        "COMPOSICAO_PARTICIPANTES": 55,
+        "COMPOSICAO_MOTIVO": 55,
+        "COMPOSICAO_CANDIDATOS": 70,
+        "DIVERGENCIA_VALOR_JUSTIFICATIVA": 55,
+        "PREENCHIMENTOS_AUTOMATICOS": 70,
     }
     for row in sheet.iter_rows(min_row=2):
         for cell in row:
             field = sheet.cell(1, cell.column).value
-            editable = field in {*FINAL_FIELDS, "INCLUIR_CNAB", "APROVADO"}
+            editable = field in {*FINAL_FIELDS, *EDITABLE_CONTROLS}
             cell.fill = PatternFill("solid", fgColor="FFF2CC" if editable else "EAF2F8")
             cell.alignment = Alignment(vertical="top", wrap_text=True)
             if field.startswith(("DOC_", "ID_", "HASH_")) or field in {
@@ -345,6 +386,8 @@ def _write_credits(sheet, rows: list[PreparedRow]) -> None:
                 "NFE",
                 "PERCENTUAL_USADO",
                 "COMISSAO_TEXTO",
+                "SELECAO_MANUAL_DOCUMENTO",
+                "COMPOSICAO_SELECAO_MANUAL_ABA",
             }:
                 cell.number_format = "@"
         sheet.row_dimensions[row[0].row].height = 44

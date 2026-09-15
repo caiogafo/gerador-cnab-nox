@@ -8,9 +8,11 @@ from typing import Any
 
 from .errors import ValidationError
 from .matching import CONEXCRED_NAME, is_lawyer_case, lawyer_identity
-from .models import CESSAO, FINAL_FIELDS, IMMUTABLE_FIELDS
+from .models import CESSAO, FINAL_FIELDS, IMMUTABLE_FIELDS, AnalyticCredit, PreparedRow
 from .normalize import (
     MAX_AGGREGATE,
+    calculate_commission,
+    digits,
     header_key,
     is_formula,
     money,
@@ -32,13 +34,29 @@ class ValidatedBatch:
 
 
 def validate_for_generation(
-    loaded: LoadedIntermediate, lawyer_rules: dict[str, tuple[str, ...]] | None = None
+    loaded: LoadedIntermediate,
+    lawyer_rules: dict[str, tuple[str, ...]] | None = None,
+    analytic: list[AnalyticCredit] | None = None,
 ) -> ValidatedBatch:
     lawyer_rules = lawyer_rules or {}
     issues = list(loaded.structural_issues)
     warnings: list[str] = []
+    analytic_by_document: dict[str, list[AnalyticCredit]] = {}
+    analytic_by_location: dict[tuple[str, int], list[AnalyticCredit]] = {}
+    if analytic:
+        for credit in analytic:
+            credit_doc = digits(credit.cedent_document)
+            if validate_document(credit_doc)[1] is not None:
+                analytic_by_document.setdefault(credit_doc, []).append(credit)
+            analytic_by_location.setdefault(
+                (credit.source_sheet, credit.source_row), []
+            ).append(credit)
+    used_manual_documents: dict[str, str] = {}
     if issues:
         raise ValidationError(issues)
+    composition_manual_credits = _resolve_composition_manual_selections(
+        loaded.rows, analytic_by_location, issues
+    )
     if loaded.unknown_count:
         issues.append(
             f"Existem {loaded.unknown_count} linha(s) não reconhecida(s) na PFMI; "
@@ -58,6 +76,7 @@ def validate_for_generation(
     selected: list[tuple[int | None, dict[str, Any]]] = []
     groups: dict[str, dict[str, Any]] = {}
     selected_credit_identities: dict[str, str] = {}
+    composition_state: dict[str, dict[str, Any]] = {}
     for position, prepared in enumerate(loaded.rows, start=2):
         values = dict(prepared.values)
         line_id = str(values.get("ID_LINHA") or f"linha {position}")
@@ -71,6 +90,96 @@ def validate_for_generation(
             issues.append(f"{label}: INCLUIR_CNAB deve ser SIM ou NAO")
         if _choice(values.get("APROVADO")) not in {"SIM", "NAO", ""}:
             issues.append(f"{label}: APROVADO deve ser SIM, NAO ou vazio")
+        composicao_aprovada = _choice(values.get("COMPOSICAO_APROVADA"))
+        if composicao_aprovada not in {"SIM", "NAO", ""}:
+            issues.append(f"{label}: COMPOSICAO_APROVADA deve ser SIM, NAO ou vazio")
+        selecao_manual_aprovada = _choice(values.get("SELECAO_MANUAL_APROVADA"))
+        if selecao_manual_aprovada not in {"SIM", "NAO", ""}:
+            issues.append(f"{label}: SELECAO_MANUAL_APROVADA deve ser SIM, NAO ou vazio")
+        # Aprovação de divergência de VALOR (PFMI x Analítico): só "SIM" ou
+        # vazio - não existe "NAO" explícito, o padrão já é o bloqueio.
+        # Justificativa é obrigatória com a aprovação e proibida sem ela,
+        # dos dois lados (nunca aprovação "muda", nunca justificativa "solta").
+        divergencia_valor_aprovada = _choice(values.get("DIVERGENCIA_VALOR_APROVADA"))
+        if divergencia_valor_aprovada not in {"SIM", ""}:
+            issues.append(f"{label}: DIVERGENCIA_VALOR_APROVADA deve ser SIM ou vazio")
+        divergencia_valor_justificativa = str(
+            values.get("DIVERGENCIA_VALOR_JUSTIFICATIVA") or ""
+        ).strip()
+        if divergencia_valor_aprovada == "SIM" and not divergencia_valor_justificativa:
+            issues.append(
+                f"{label}: DIVERGENCIA_VALOR_JUSTIFICATIVA é obrigatória quando "
+                "DIVERGENCIA_VALOR_APROVADA=SIM"
+            )
+        if divergencia_valor_justificativa and divergencia_valor_aprovada != "SIM":
+            issues.append(
+                f"{label}: DIVERGENCIA_VALOR_JUSTIFICATIVA só é aceita quando "
+                "DIVERGENCIA_VALOR_APROVADA=SIM"
+            )
+        divergencia_valor_confirmada = bool(
+            divergencia_valor_aprovada == "SIM" and divergencia_valor_justificativa
+        )
+        composicao_id = str(prepared.originals.get("COMPOSICAO_ID") or "").strip()
+        if composicao_id:
+            state = composition_state.setdefault(
+                composicao_id,
+                {
+                    "estado": str(prepared.originals.get("COMPOSICAO_ESTADO") or ""),
+                    "aprovadas": set(),
+                    "escolhas": set(),
+                    "labels": [],
+                    "div_aprovadas": set(),
+                    "div_justificativas": set(),
+                    "nominal_sum": Decimal("0.00"),
+                    "nominal_count": 0,
+                    "nominal_esperado": None,
+                    "qtd_componentes": None,
+                },
+            )
+            state["aprovadas"].add(composicao_aprovada)
+            state["escolhas"].add(choice)
+            state["labels"].append(label)
+            state["div_aprovadas"].add(divergencia_valor_aprovada)
+            state["div_justificativas"].add(divergencia_valor_justificativa)
+            # Soma dos nominais individuais x nominal do crédito compartilhado
+            # (regra 5): sempre em Decimal, normalizado em centavos - nunca
+            # float. Só o valor esperado é lido aqui (imutável, protegido);
+            # a soma real só é fechada depois do laço, com todos os
+            # componentes já processados.
+            try:
+                state["nominal_esperado"] = money(
+                    prepared.originals.get("COMPOSICAO_NOMINAL_ANALITICO"), allow_blank=True
+                )
+            except ValueError:
+                state["nominal_esperado"] = None
+            try:
+                state["qtd_componentes"] = int(
+                    str(prepared.originals.get("COMPOSICAO_QTD_COMPONENTES") or "0")
+                )
+            except ValueError:
+                state["qtd_componentes"] = None
+            divergencia_valor_ok = (
+                state["estado"] == "BLOQUEADA_DIVERGENCIA_VALOR" and divergencia_valor_confirmada
+            )
+            effectively_proposta = (
+                state["estado"] == "PROPOSTA"
+                or composicao_id in composition_manual_credits
+                or divergencia_valor_ok
+            )
+            if composicao_aprovada == "SIM" and not effectively_proposta:
+                issues.append(
+                    f"{label}: COMPOSICAO_APROVADA=SIM só é permitido quando "
+                    "COMPOSICAO_ESTADO é PROPOSTA, a seleção manual do principal fechou "
+                    "exatamente, ou a divergência de valor foi aprovada com justificativa "
+                    "(DIVERGENCIA_VALOR_APROVADA/JUSTIFICATIVA)"
+                )
+            if choice == "SIM" and composicao_aprovada != "SIM":
+                issues.append(
+                    f"{label}: título de composição só pode ser incluído (INCLUIR_CNAB=SIM) "
+                    "quando COMPOSICAO_APROVADA=SIM para todo o grupo"
+                )
+            if choice == "SIM" and values.get("VL_NOMINAL") in (None, ""):
+                issues.append(f"{label}: PREENCHER_VL_NOMINAL_COMPOSICAO")
         for control in IMMUTABLE_FIELDS:
             if _canonical(values.get(control)) != _canonical(prepared.originals.get(control)):
                 issues.append(f"{label}: controle de proveniência {control} foi alterado")
@@ -99,15 +208,54 @@ def validate_for_generation(
         analytic_reference = str(prepared.originals.get("REFERENCIA_ANALITICO") or "").strip()
         credit_id = str(prepared.originals.get("ID_CREDITO") or "")
         if not analytic_line or not analytic_reference or not credit_id:
-            issues.append(
-                f"{label}: linha sem crédito original do Analítico não pode ser selecionada"
-            )
-            continue
+            if composicao_id and composicao_id in composition_manual_credits:
+                # Principal de composição resolvido por referência manual
+                # única (ver _resolve_composition_manual_selections): já
+                # fechou exatamente com a soma de todos os componentes: todo
+                # componente (principal e satélites) compartilha este mesmo
+                # crédito, igual à composição detectada automaticamente.
+                manual_credit = composition_manual_credits[composicao_id]
+            else:
+                manual_credit = _resolve_manual_selection(
+                    values,
+                    prepared.originals,
+                    target,
+                    selecao_manual_aprovada,
+                    analytic_by_document,
+                    label,
+                    issues,
+                )
+                if manual_credit is None:
+                    continue
+                manual_doc = digits(values.get("SELECAO_MANUAL_DOCUMENTO"))
+                previous_owner = used_manual_documents.get(manual_doc)
+                if previous_owner is not None and previous_owner != group_id:
+                    issues.append(
+                        f"{label}: o mesmo documento de seleção manual já foi usado em outro grupo"
+                    )
+                    continue
+                used_manual_documents[manual_doc] = group_id
+            credit_id = manual_credit.credit_id
+            analytic_line = str(manual_credit.source_row)
+            analytic_reference = manual_credit.reference
+        # A identidade do crédito já está fixada acima (automática, por
+        # documento manual ou pela composição) - se só o VALOR diverge e a Lu
+        # aprovou explicitamente com justificativa, usa exatamente o total do
+        # PFMI no lugar da aquisição do Analítico. Nunca decide isso sozinha:
+        # sem aprovação+justificativa, o valor do Analítico (ou a ausência de
+        # crédito) segue bloqueando a linha/grupo como hoje.
+        if divergencia_valor_confirmada and target is not None:
+            values["VL_PRESENTE"] = target
         identity = credit_id
-        if identity in selected_credit_identities:
+        # Componentes de uma mesma composição compartilham deliberadamente um
+        # único crédito (ver COMPOSICAO_ID); só é reutilização indevida se o
+        # crédito aparecer fora dessa composição especifica.
+        owner = f"COMPOSICAO:{composicao_id}" if composicao_id else group_id
+        existing = selected_credit_identities.get(identity)
+        if existing is not None and existing != owner:
             issues.append(f"{label}: o mesmo crédito do Analítico foi selecionado mais de uma vez")
             continue
-        selected_credit_identities[identity] = group_id
+        selected_credit_identities[identity] = owner
         raw_reserved = prepared.originals.get("SEU_NUMERO")
         if raw_reserved in (None, ""):
             # Prepared before a first sequence was available (e.g. informed
@@ -128,6 +276,52 @@ def validate_for_generation(
             group["sum"] += parsed["VL_PRESENTE"]
             group["count"] += 1
             selected.append((reserved_sequence, parsed))
+            if composicao_id:
+                composition_state[composicao_id]["nominal_sum"] += parsed["VL_NOMINAL"]
+                composition_state[composicao_id]["nominal_count"] += 1
+
+    for composicao_id, state in composition_state.items():
+        if len(state["aprovadas"]) > 1:
+            issues.append(
+                f"Composição {composicao_id}: COMPOSICAO_APROVADA deve ser igual em "
+                f"todas as linhas ({', '.join(state['labels'])})"
+            )
+        if len(state["escolhas"]) > 1:
+            issues.append(
+                f"Composição {composicao_id}: INCLUIR_CNAB deve ser igual em todas as "
+                f"linhas, tudo ou nada ({', '.join(state['labels'])})"
+            )
+        if len(state["div_aprovadas"]) > 1:
+            issues.append(
+                f"Composição {composicao_id}: DIVERGENCIA_VALOR_APROVADA deve ser igual "
+                f"em todas as linhas ({', '.join(state['labels'])})"
+            )
+        if len(state["div_justificativas"]) > 1:
+            issues.append(
+                f"Composição {composicao_id}: DIVERGENCIA_VALOR_JUSTIFICATIVA deve ser "
+                f"igual em todas as linhas ({', '.join(state['labels'])})"
+            )
+        # Soma dos nominais individuais x nominal do crédito compartilhado
+        # (regra adicional de segurança, não é afrouxamento): só avalia
+        # quando a composição inteira foi incluída e todo componente já
+        # tem VL_NOMINAL validado - do contrário outras checagens já
+        # bloqueiam a linha/grupo em falta, sem duplicar o motivo. Decimal
+        # exato, sem tolerância: qualquer diferença, inclusive R$0,01,
+        # bloqueia.
+        if (
+            state["escolhas"] == {"SIM"}
+            and state["qtd_componentes"] is not None
+            and state["nominal_count"] == state["qtd_componentes"]
+            and state["nominal_esperado"] is not None
+        ):
+            diferenca = state["nominal_sum"] - state["nominal_esperado"]
+            if diferenca != Decimal("0.00"):
+                issues.append(
+                    f"Composição {composicao_id}: soma dos nominais informados "
+                    f"({state['nominal_sum']:.2f}) diverge do nominal do crédito "
+                    f"compartilhado ({state['nominal_esperado']:.2f}); diferença de "
+                    f"{diferenca:+.2f}"
+                )
 
     for group_id, group in groups.items():
         if not group_id:
@@ -324,6 +518,249 @@ def _validate_selected(
         if _comparable(values.get(field)) != _comparable(originals.get(field)):
             warnings.append(f"{values.get('ID_LINHA')}: {field} foi alterado no Excel")
     return parsed if len(issues) == start_issues else None
+
+
+def _resolve_composition_manual_selections(
+    rows: list[PreparedRow],
+    analytic_by_location: dict[tuple[str, int], list[AnalyticCredit]],
+    issues: list[str],
+) -> dict[str, AnalyticCredit]:
+    """Explicit, human-initiated fallback for a composition principal that the
+    automatic detection could not locate (COMPOSICAO_ESTADO != PROPOSTA).
+
+    Identifies a SINGLE physical record of the Analítico - its own sheet
+    (ABA) and physical row (LINHA), the same coordinates that already make
+    AnalyticCredit.credit_id deterministic and unique - never a shared
+    campaign/batch field such as "Prospect", which some real Analítico files
+    reuse across hundreds of unrelated credits and can never safely identify
+    one of them. COMPOSICAO_CANDIDATOS (matching.py) lists exact-value
+    matches (name, masked document, value, aba/linha) for the operator to
+    review before choosing.
+
+    Mirrors _resolve_manual_selection's safety properties at the composition
+    level: never triggered unless the operator filled both ABA and LINHA
+    after checking the physical instrument; the location must resolve to
+    exactly one credit and be identical on every component row (auditable -
+    no silent per-row override, and no tampering by pointing only the
+    satellite somewhere else); the combined PFMI total across every
+    component must close exactly (Decimal, no rounding - ambiguities and
+    R$0.01 differences stay blocked) with that credit's expected
+    acquisition. Approving the name divergence (APROVADO) and the
+    composition itself (COMPOSICAO_APROVADA) still goes through the existing
+    fields, exactly like an automatically detected PROPOSTA composition.
+    """
+    groups: dict[str, dict[str, Any]] = {}
+    for prepared in rows:
+        composicao_id = str(prepared.originals.get("COMPOSICAO_ID") or "").strip()
+        if not composicao_id:
+            continue
+        if str(prepared.originals.get("COMPOSICAO_ESTADO") or "") == "PROPOSTA":
+            continue
+        entry = groups.setdefault(
+            composicao_id,
+            {
+                "localizacoes": set(),
+                "divergencias": set(),
+                "principal": str(prepared.originals.get("COMPOSICAO_PARTICIPANTES") or "")
+                .split(";")[0]
+                .strip(),
+                "rows": [],
+            },
+        )
+        aba_raw = str(prepared.values.get("COMPOSICAO_SELECAO_MANUAL_ABA") or "").strip()
+        linha_raw = prepared.values.get("COMPOSICAO_SELECAO_MANUAL_LINHA")
+        linha_raw = "" if linha_raw in (None, "") else str(linha_raw).strip()
+        entry["localizacoes"].add((aba_raw, linha_raw))
+        entry["divergencias"].add(
+            (
+                _choice(prepared.values.get("DIVERGENCIA_VALOR_APROVADA")),
+                str(prepared.values.get("DIVERGENCIA_VALOR_JUSTIFICATIVA") or "").strip(),
+            )
+        )
+        entry["rows"].append(
+            {
+                "name": str(prepared.originals.get("NOME_CEDENTE_PFMI") or "").strip(),
+                "target": prepared.originals.get("TOTAL_PFMI_GRUPO"),
+                "percentual": prepared.originals.get("PERCENTUAL_USADO"),
+            }
+        )
+
+    resolved: dict[str, AnalyticCredit] = {}
+    for composicao_id, entry in groups.items():
+        attempted = {loc for loc in entry["localizacoes"] if loc != ("", "")}
+        if not attempted:
+            continue  # operador não tentou seleção manual; composição segue bloqueada
+        label = f"Composição {composicao_id} (seleção manual do principal)"
+        if len(entry["localizacoes"]) > 1:
+            issues.append(
+                f"{label}: COMPOSICAO_SELECAO_MANUAL_ABA/LINHA devem ser preenchidos e "
+                "iguais em todas as linhas da composição"
+            )
+            continue
+        aba_raw, linha_raw = next(iter(attempted))
+        linha = _int_or_none(linha_raw)
+        if not aba_raw or linha is None:
+            issues.append(
+                f"{label}: informe COMPOSICAO_SELECAO_MANUAL_ABA e "
+                "COMPOSICAO_SELECAO_MANUAL_LINHA (os dois) para usar a seleção manual"
+            )
+            continue
+        matches = analytic_by_location.get((aba_raw, linha), [])
+        if len(matches) == 0:
+            issues.append(
+                f"{label}: nenhum crédito do Analítico foi encontrado em "
+                f"{aba_raw!r}, linha {linha}"
+            )
+            continue
+        if len(matches) > 1:
+            issues.append(
+                f"{label}: mais de um crédito do Analítico corresponde a "
+                f"{aba_raw!r}, linha {linha}"
+            )
+            continue
+        credit = matches[0]
+        principal_rows = [r for r in entry["rows"] if r["name"] == entry["principal"]]
+        if len(principal_rows) != 1:
+            issues.append(
+                f"{label}: não foi possível identificar de forma única o principal da composição"
+            )
+            continue
+        targets: list[Decimal | None] = []
+        for r in entry["rows"]:
+            try:
+                targets.append(money(r["target"], maximum=MAX_AGGREGATE))
+            except ValueError:
+                targets.append(None)
+        if any(t is None for t in targets):
+            issues.append(f"{label}: total PFMI original inválido em algum componente")
+            continue
+        total_pfmi = sum(targets, Decimal("0.00"))
+        try:
+            rate = Decimal(str(principal_rows[0]["percentual"] or "0"))
+            _, _, expected = calculate_commission(
+                credit.nominal_value, credit.acquisition_value, rate
+            )
+        except (ValueError, ArithmeticError) as exc:
+            issues.append(f"{label}: {exc}")
+            continue
+        if expected is None:
+            issues.append(
+                f"{label}: não foi possível calcular a aquisição esperada do crédito selecionado"
+            )
+            continue
+        if expected != total_pfmi:
+            # A localização (aba/linha) já identifica um único crédito sem
+            # ambiguidade; só o VALOR diverge. Nunca aceita sozinho - exige
+            # DIVERGENCIA_VALOR_APROVADA=SIM com justificativa, idêntica em
+            # todas as linhas (mesma checagem simples de aba/linha acima);
+            # a inconsistência entre linhas é reportada separadamente pela
+            # verificação geral de composição.
+            divergencias = entry["divergencias"]
+            confirmed = (
+                len(divergencias) == 1
+                and next(iter(divergencias))[0] == "SIM"
+                and next(iter(divergencias))[1] != ""
+            )
+            if not confirmed:
+                issues.append(
+                    f"{label}: o registro selecionado não fecha exatamente com a soma dos "
+                    f"componentes da composição (diferença de {total_pfmi - expected:+.2f}); "
+                    "aprove explicitamente em DIVERGENCIA_VALOR_APROVADA com justificativa, "
+                    "igual em todas as linhas, para usar o valor do PFMI"
+                )
+                continue
+        resolved[composicao_id] = credit
+    return resolved
+
+
+def _resolve_manual_selection(
+    values: dict[str, Any],
+    originals: dict[str, Any],
+    target: Decimal | None,
+    selecao_manual_aprovada: str,
+    analytic_by_document: dict[str, list[AnalyticCredit]],
+    label: str,
+    issues: list[str],
+) -> AnalyticCredit | None:
+    """Explicit, human-initiated fallback for a row with no automatic credit.
+
+    Never triggered automatically: the operator must have already read the
+    physical instrument, typed the credit's own CPF/CNPJ, and set
+    SELECAO_MANUAL_APROVADA=SIM. A single valid, exact document match is
+    required (no similarity, never across a different falência - the
+    document must belong to a credit already filtered by analytic_by_document
+    at the caller). Financial closure reuses the existing homologated
+    formula, exact in Decimal, no rounding, no proration.
+    """
+    manual_doc_raw = values.get("SELECAO_MANUAL_DOCUMENTO")
+    manual_doc = digits(manual_doc_raw) if manual_doc_raw else ""
+    if not manual_doc:
+        issues.append(
+            f"{label}: linha sem crédito original do Analítico não pode ser selecionada"
+        )
+        return None
+    if validate_document(manual_doc)[1] is None:
+        issues.append(f"{label}: SELECAO_MANUAL_DOCUMENTO inválido")
+        return None
+    if selecao_manual_aprovada != "SIM":
+        issues.append(
+            f"{label}: SELECAO_MANUAL_APROVADA deve ser SIM para usar a seleção manual "
+            "por documento"
+        )
+        return None
+    matches = analytic_by_document.get(manual_doc, [])
+    if len(matches) == 0:
+        issues.append(
+            f"{label}: nenhum crédito do Analítico tem o documento de SELECAO_MANUAL_DOCUMENTO"
+        )
+        return None
+    if len(matches) > 1:
+        issues.append(
+            f"{label}: mais de um crédito do Analítico tem o documento de "
+            "SELECAO_MANUAL_DOCUMENTO"
+        )
+        return None
+    credit = matches[0]
+    if target is None:
+        issues.append(f"{label}: total PFMI original inválido para conferir a seleção manual")
+        return None
+    try:
+        rate = Decimal(str(originals.get("PERCENTUAL_USADO") or "0"))
+        _, _, expected = calculate_commission(credit.nominal_value, credit.acquisition_value, rate)
+    except (ValueError, ArithmeticError) as exc:
+        issues.append(f"{label}: {exc}")
+        return None
+    if expected is None:
+        issues.append(
+            f"{label}: não foi possível calcular a aquisição esperada do crédito selecionado"
+        )
+        return None
+    if expected != target:
+        # A identidade (documento) já está confirmada e sem ambiguidade; só o
+        # VALOR diverge. Nunca aceita sozinho - exige aprovação explícita e
+        # justificada (ver DIVERGENCIA_VALOR_APROVADA/JUSTIFICATIVA), e o
+        # chamador usa o total do PFMI, nunca este "expected" do Analítico.
+        aprovada = _choice(values.get("DIVERGENCIA_VALOR_APROVADA"))
+        justificativa = str(values.get("DIVERGENCIA_VALOR_JUSTIFICATIVA") or "").strip()
+        if aprovada != "SIM" or not justificativa:
+            issues.append(
+                f"{label}: o crédito de SELECAO_MANUAL_DOCUMENTO não fecha exatamente com o "
+                f"total do PFMI (diferença de {target - expected:+.2f}); aprove "
+                "explicitamente em DIVERGENCIA_VALOR_APROVADA com justificativa para usar "
+                "o valor do PFMI"
+            )
+            return None
+    entered_nominal = values.get("VL_NOMINAL")
+    try:
+        if entered_nominal is None or money(entered_nominal) != credit.nominal_value:
+            raise ValueError
+    except ValueError:
+        issues.append(
+            f"{label}: VL_NOMINAL deve ser exatamente o nominal do crédito selecionado "
+            "manualmente"
+        )
+        return None
+    return credit
 
 
 def _choice(value: Any) -> str:

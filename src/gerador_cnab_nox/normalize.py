@@ -48,6 +48,47 @@ def normalize_name(value: Any) -> str:
     return " ".join(canonical)
 
 
+_NAME_JOIN_STOPWORDS = frozenset({"DA", "DE", "DO", "DAS", "DOS", "E"})
+_VOWELS = frozenset("AEIOU")
+
+
+def _fold_sz(token: str) -> str:
+    """Fold S/Z at a word's final or intervocalic position to one spelling.
+
+    Only that narrow, documented Portuguese variant class (LUIZ/LUIS,
+    SOUZA/SOUSA) is folded - never a bare similarity score, and only ever
+    used together with an independent, checksum-confirmed document match
+    (see matching.py); it never substitutes for identity confirmation on
+    its own.
+    """
+    chars = list(token)
+    last = len(chars) - 1
+    for index, char in enumerate(chars):
+        if char not in ("S", "Z"):
+            continue
+        at_end = index == last
+        intervocalic = (
+            0 < index < last and chars[index - 1] in _VOWELS and chars[index + 1] in _VOWELS
+        )
+        if at_end or intervocalic:
+            chars[index] = "S"
+    return "".join(chars)
+
+
+def names_equivalent_under_confirmed_document(name_a: Any, name_b: Any) -> bool:
+    """Deterministic name-spelling equivalence, gated by the CALLER already
+    having confirmed both names refer to the same document (never called to
+    decide identity by itself). Ignores common Portuguese connective
+    stopwords and folds the documented S/Z variant class only; never a
+    probabilistic/fuzzy similarity score."""
+
+    def fold(value: Any) -> tuple[str, ...]:
+        tokens = normalize_name(value).split()
+        return tuple(_fold_sz(token) for token in tokens if token not in _NAME_JOIN_STOPWORDS)
+
+    return fold(name_a) == fold(name_b)
+
+
 def technical_name(value: Any) -> str:
     text = strip_accents(str(value or "")).upper()
     if any(unicodedata.category(char).startswith("C") for char in text):
@@ -102,6 +143,16 @@ def digits(value: Any) -> str:
     if isinstance(value, float) and value.is_integer():
         value = int(value)
     return re.sub(r"\D", "", str(value))
+
+
+def mask_document(value: Any) -> str:
+    # Only for human review lists (e.g. composition manual-selection
+    # candidates), never for the CNAB output itself. Keeps just enough of the
+    # digits to distinguish entries without exposing the full CPF/CNPJ.
+    doc = digits(value)
+    if len(doc) <= 4:
+        return "*" * len(doc)
+    return doc[:2] + "*" * (len(doc) - 4) + doc[-2:]
 
 
 def validate_document(value: Any) -> tuple[str, int | None]:

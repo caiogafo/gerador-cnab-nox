@@ -85,9 +85,82 @@ CONTROL_FIELDS = (
     "ACAO_NECESSARIA",
     "EXIGE_NOVA_PREPARACAO",
     "EMISSAO_NOVA_CESSAO_TEXTO_ORIGINAL",
+    # Composição: proposta exploratória de que vários pagamentos do PFMI
+    # (grupos distintos) correspondem a um único crédito do Analítico. Nunca
+    # confirma identidade nem seleciona sozinha; ver COMPOSICAO_APROVADA.
+    "COMPOSICAO_ID",
+    "COMPOSICAO_REGRA",
+    "COMPOSICAO_QTD_COMPONENTES",
+    "COMPOSICAO_PARTICIPANTES",
+    "COMPOSICAO_TOTAL_PFMI",
+    "COMPOSICAO_TOTAL_ANALITICO",
+    "COMPOSICAO_DIFERENCA_PRESENTE",
+    "COMPOSICAO_NOMINAL_ANALITICO",
+    "VL_NOMINAL_SUGERIDO",  # Pro-rata original protegido; aprovação permanece manual.
+    "COMPOSICAO_MOTIVO",
+    "COMPOSICAO_ESTADO",
+    "COMPOSICAO_APROVADA",
+    # Seleção manual: quando o nome não bate e não há um único documento
+    # válido igual na mesma falência (ver matching.py), o operador do fundo
+    # identifica o crédito fora do sistema (conferindo o instrumento) e
+    # informa aqui o CPF/CNPJ exato do crédito do Analítico, aprovando
+    # explicitamente essa divergência - nunca automático, nunca por
+    # similaridade, nunca atravessa falências sem essa aprovação.
+    "SELECAO_MANUAL_DOCUMENTO",
+    "SELECAO_MANUAL_APROVADA",
+    # Seleção manual do PRINCIPAL de uma composição quando a detecção
+    # automática falha (nome e documento na mesma falência não localizam o
+    # crédito): nunca por um campo de campanha/lote (ex.: "Prospect"), que
+    # pode ser compartilhado por centenas de créditos - o operador escolhe um
+    # REGISTRO ÚNICO do Analítico (aba + linha física da planilha, que
+    # identifica exatamente um crédito, igual a ID_CREDITO/credit_id
+    # internamente) depois de conferir o instrumento entre os candidatos
+    # listados em COMPOSICAO_CANDIDATOS. Nunca automático, nunca por
+    # similaridade. A soma exata dos componentes com a aquisição esperada
+    # desse registro é sempre recalculada aqui (ver validation.py); só então
+    # a composição passa a poder ser aprovada (COMPOSICAO_APROVADA) e a
+    # divergência de nome aprovada (APROVADO) como qualquer outra.
+    "COMPOSICAO_CANDIDATOS",
+    "COMPOSICAO_SELECAO_MANUAL_ABA",
+    "COMPOSICAO_SELECAO_MANUAL_LINHA",
+    # Aprovação de divergência de VALOR: quando o crédito já está identificado
+    # sem ambiguidade (nome, documento na mesma falência, seleção manual por
+    # documento, ou principal de composição já resolvido) mas o Valor
+    # Aquisição do Analítico não fecha exatamente com o total do PFMI, o
+    # sistema nunca aceita automaticamente nem arredonda. Estes 3 campos são
+    # somente leitura, calculados na preparação sempre que essa divergência
+    # existir (ficam vazios nos demais casos); DIVERGENCIA_VALOR_APROVADA e a
+    # justificativa são a única forma de liberar o uso do valor do PFMI no
+    # CNAB - nunca do Analítico, nunca uma média ou resíduo compensado. Uma
+    # aprovação nunca resolve identidade, nome ou documento por conta própria
+    # (ver validation.py); em composição, precisa ser idêntica em todas as
+    # linhas, além de COMPOSICAO_APROVADA=SIM continuar exigido.
+    "DIVERGENCIA_VALOR_ANALITICO",
+    "DIVERGENCIA_VALOR_PFMI",
+    "DIVERGENCIA_VALOR_DIFERENCA",
+    "DIVERGENCIA_VALOR_APROVADA",
+    "DIVERGENCIA_VALOR_JUSTIFICATIVA",
+    # Auditoria (somente leitura, protegida como as demais - nunca editável):
+    # lista JSON de todo preenchimento/sugestão automática feita nesta linha
+    # na preparação (campo, valor anterior, valor sugerido, regra
+    # determinística aplicada, arquivo/referência de origem, e se ainda
+    # exige aprovação humana). Nunca inclui seleção de crédito nem
+    # aprovação - inclui campos de fonte comprovada e a sugestão matemática
+    # de nominal proporcional, que exige aprovação humana da composição.
+    "PREENCHIMENTOS_AUTOMATICOS",
 )
 
-EDITABLE_CONTROLS = {"INCLUIR_CNAB", "APROVADO"}
+EDITABLE_CONTROLS = {
+    "INCLUIR_CNAB",
+    "APROVADO",
+    "COMPOSICAO_APROVADA",
+    "SELECAO_MANUAL_DOCUMENTO",
+    "SELECAO_MANUAL_APROVADA",
+    "COMPOSICAO_SELECAO_MANUAL_ABA",
+    "COMPOSICAO_SELECAO_MANUAL_LINHA",
+    "DIVERGENCIA_VALOR_APROVADA",
+    "DIVERGENCIA_VALOR_JUSTIFICATIVA",
+}
 DISPLAY_CONTROLS = {
     "STATUS",
     "PENDENCIAS",
@@ -219,6 +292,7 @@ class PreparedBatch:
     sources: list[dict[str, Any]] = field(default_factory=list)
     payments_snapshot: list[dict[str, Any]] = field(default_factory=list)
     related_suggestions: list[dict[str, Any]] = field(default_factory=list)
+    compositions: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -231,6 +305,7 @@ class PreparationResult:
     payment_count: int = 0
     group_count: int = 0
     related_suggestions: tuple[dict[str, Any], ...] = ()
+    compositions: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -243,3 +318,4 @@ class GenerationResult:
     last_sequence: int
     warning_count: int
     warnings: tuple[str, ...]
+    compositions: tuple[dict[str, Any], ...] = ()
