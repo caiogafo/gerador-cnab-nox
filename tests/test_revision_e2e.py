@@ -385,7 +385,8 @@ def test_t23_approving_alternative_later_keeps_reserved_sequence_and_later_group
     x_row = next(r for r in loaded.rows if r.values["NOME_CEDENTE_PFMI"] == "PESSOA X")
     y_row = next(r for r in loaded.rows if r.values["NOME_CEDENTE_PFMI"] == "PESSOA Y")
     assert x_row.values["SEU_NUMERO"] == 500 and x_row.values["INCLUIR_CNAB"] == "SIM"
-    assert y_row.values["SEU_NUMERO"] == 501 and y_row.values["INCLUIR_CNAB"] == "NAO"
+    assert y_row.values["SEU_NUMERO"] == 501 and y_row.values["INCLUIR_CNAB"] == "SIM"
+    assert y_row.values["APROVADO"] == "SIM_SISTEMA"
 
     book = load_workbook(path)
     sh = book["CREDITOS"]

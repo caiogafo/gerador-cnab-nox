@@ -39,9 +39,8 @@ _PENDING_MESSAGES = (
     ),
     (
         "DIVERGENCIA_VALOR",
-        "O valor do Analítico e o valor da PFMI não coincidem exatamente. Confira o "
-        "instrumento; se o crédito estiver correto, você pode aprovar o uso do valor da "
-        "PFMI em DIVERGENCIA_VALOR_APROVADA, com uma justificativa.",
+        "O valor do Analítico diverge da PFMI. Dentro da tolerância configurada, o TXT "
+        "usa a PFMI com alerta; acima do limite, corrija as fontes e prepare novamente.",
     ),
     ("DIVERGENCIA_NOME", "O nome no sistema é diferente do nome na PFMI. Confira e corrija."),
     ("DOC_CEDENTE_INVALIDO", "O documento do cedente está inválido. Confira e corrija."),
@@ -83,7 +82,7 @@ def explain_pending(codes: str) -> str:
 _ACTION_INSTRUCTIONS = (
     ("COMPOSICAO_BLOQUEADA_SELECAO_MANUAL", "Indicar Aba/Linha do Analítico (Cols CM/CN)."),
     ("CREDITO_NAO_LOCALIZADO", "Indicar Aba/Linha do Analítico (Cols CM/CN)."),
-    ("DIVERGENCIA_VALOR", "Aprovar diferença de centavos com justificativa (Cols CP/CQ)."),
+    ("DIVERGENCIA_VALOR", "Conferir tolerância; acima do limite, corrigir as fontes."),
     ("DIVERGENCIA_NOME", "Validar divergência de grafia (APROVADO=SIM)."),
 )
 
@@ -107,6 +106,8 @@ def format_action_instruction(pendencias: set[str], composicao_estado: str = "")
 
 def explain_issue(message: str) -> str:
     """Use only locations present in the issue, without reopening the workbook."""
+    if "TOLERATED_WARNING" in message or "CRITICAL_ERROR" in message:
+        return message
     row = re.search(r"CREDITOS linha (\d+)", message)
     group = re.search(r"Grupo ([^:]+):", message)
     location = f"CREDITOS, linha {row[1]}: " if row else ""
@@ -167,11 +168,9 @@ def explain_issue(message: str) -> str:
         )
     elif "DIVERGENCIA_VALOR" in message:
         action = (
-            "O valor do Analítico e o valor da PFMI não coincidem exatamente - nem "
-            "diferenças de centavos são ignoradas automaticamente. Confira o instrumento; "
-            "se o crédito estiver correto, aprove o uso do valor da PFMI em "
-            "DIVERGENCIA_VALOR_APROVADA, explicando o motivo em "
-            "DIVERGENCIA_VALOR_JUSTIFICATIVA."
+            "Confira a diferença em centavos entre o Analítico e a PFMI. Até o limite "
+            "configurado, o TXT usa a PFMI com alerta; acima dele, corrija as fontes e "
+            "prepare novamente. A aprovação manual não ultrapassa esse limite."
         )
     elif "DIVERGENCIA_NOME" in message:
         action = (
@@ -183,6 +182,11 @@ def explain_issue(message: str) -> str:
         action = f"Confira e corrija o documento do {person} na aba CREDITOS."
     elif "nenhum crédito selecionado" in message or "Nenhum crédito válido" in message:
         action = "Confira a seleção de créditos na aba CREDITOS e as demais pendências do grupo."
+    elif "COMPOSICAO_APROVADA" in message or "PREENCHER_VL_NOMINAL_COMPOSICAO" in message:
+        action = (
+            "Preencha VL_NOMINAL de cada componente e marque COMPOSICAO_APROVADA=SIM "
+            "em todas as linhas da composição após conferir o instrumento."
+        )
     elif "INCLUIR_CNAB" in message:
         action = "Preencha INCLUIR_CNAB com SIM ou NAO na aba CREDITOS e salve o Excel."
     elif "selecionado mais de uma vez" in message:

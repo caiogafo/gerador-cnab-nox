@@ -12,8 +12,9 @@ class InputFileError(UserFacingError):
 class ValidationError(UserFacingError):
     """Pendências que impedem a geração do TXT."""
 
-    def __init__(self, issues: list[str]):
+    def __init__(self, issues: list[str], reconciliation=None):
         self.issues = issues
+        self.reconciliation = reconciliation
         preview = "\n".join(f"- {item}" for item in issues[:20])
         suffix = "\n- ..." if len(issues) > 20 else ""
         super().__init__(f"O TXT não foi gerado. Corrija as pendências:\n{preview}{suffix}")

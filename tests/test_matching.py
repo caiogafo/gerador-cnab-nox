@@ -101,7 +101,8 @@ def test_negative_candidate_values_are_visible_and_not_auto_selected() -> None:
     assert "VL_PRESENTE_NEGATIVO" in batch.rows[0].values["PENDENCIAS"]
 
 
-def test_one_cent_difference_requires_review() -> None:
+def test_one_cent_difference_requires_review(monkeypatch) -> None:
+    monkeypatch.setenv("MAX_TOLERANCE_DIFF_REAIS", "0")
     batch = prepare_batch(
         PfmiData(payments=[_payment("B0001", "100.00")]),
         [_credit("A", "99.99")],
@@ -364,7 +365,8 @@ def test_sequence_is_reserved_per_group_and_shared_by_alternatives():
     # Group B: only a divergent-name alternative -> reserves one number too (101),
     # shared if there were more than one alternative candidate.
     assert all(r["SEU_NUMERO"] == 101 for r in groups[1])
-    assert groups[1][0]["INCLUIR_CNAB"] == "NAO"
+    assert groups[1][0]["INCLUIR_CNAB"] == "SIM"
+    assert groups[1][0]["APROVADO"] == "SIM_SISTEMA"
     # Group C never shifts because of group B's alternative(s).
     assert groups[2][0]["SEU_NUMERO"] == 102
 

@@ -8,11 +8,14 @@ from pathlib import Path
 from typing import Any
 
 from .cnab import write_cnab
+from .debtor_fallbacks import load_fallbacks
+from .errors import ValidationError
 from .failure_aliases import validate_aliases
 from .matching import prepare_batch
 from .models import GenerationResult, PfmiInput, PreparationRequest, PreparationResult
 from .normalize import parse_date, parse_positive_int
 from .readers import read_analytic, read_due_base, read_pfmis
+from .reconciliation import tolerance_cents
 from .validation import validate_for_generation
 from .workbook import read_intermediate, write_intermediate
 
@@ -28,8 +31,14 @@ def prepare_workbook(
     log_directory: str | Path | None = None,
     failure_aliases: dict[str, str] | None = None,
     lawyer_rules: dict[str, tuple[str, ...]] | None = None,
+    fallback_document_path: str | Path | None = None,
 ) -> PreparationResult:
+    try:
+        tolerance_cents()
+    except ValueError as exc:
+        raise ValidationError([str(exc)]) from exc
     aliases = validate_aliases(failure_aliases or {})
+    fallbacks = load_fallbacks(fallback_document_path)
     if isinstance(pfmi_path, PreparationRequest):
         request = pfmi_path
         inputs = request.pfmis
@@ -56,6 +65,7 @@ def prepare_workbook(
         first_sequence=parsed_sequence,
         failure_aliases=aliases,
         lawyer_rules=lawyer_rules or {},
+        debtor_fallbacks=fallbacks,
     )
     batch.liquidation_date = parsed_date if parsed_date is not None else liquidation_date
     batch.first_sequence = parsed_sequence if parsed_sequence is not None else first_sequence
@@ -77,6 +87,7 @@ def prepare_workbook(
             "sequencia_texto": str(first_sequence),
         },
         {"tipo": "EQUIVALENCIAS_FALENCIAS", "confirmadas": aliases},
+        {"tipo": "FALLBACK_SACADOS", "cadastro": fallbacks},
     ]
     batch.warnings.extend(
         warning for warning in (date_warning, sequence_warning) if warning is not None
@@ -97,7 +108,12 @@ def prepare_workbook(
         + len(batch.unknown_rows)
         + len(batch.warnings)
     )
-    operation_warnings: list[str] = []
+    operation_warnings: list[str] = list(dict.fromkeys(
+        str(row.values.get("ALERTAS") or "") for row in batch.rows
+        if any(marker in str(row.values.get("ALERTAS") or "") for marker in (
+            "TOLERATED_WARNING", "SIM_SISTEMA", "FALLBACK_SACADO", "SMART_MATCH_ABORTADO",
+        ))
+    ))
     try:
         _audit(
             log_directory or destination.parent / "logs",
@@ -152,7 +168,18 @@ def generate_cnab(
             analytic = read_analytic(analytic_path)
         except Exception:
             analytic = None
-    batch = validate_for_generation(loaded, lawyer_rules or {}, analytic)
+    try:
+        batch = validate_for_generation(loaded, lawyer_rules or {}, analytic)
+    except ValidationError as exc:
+        if exc.reconciliation is not None:
+            try:
+                _audit(log_directory or source.parent / "logs", {
+                    "evento": "gerar", "resultado": "bloqueado",
+                    "reconciliation": exc.reconciliation.to_audit_dict(),
+                })
+            except OSError:
+                exc.add_note("LOG_AUDITORIA_NAO_GRAVADO; geração permanece bloqueada")
+        raise
     destination = (
         Path(output_path) if output_path else _unique_output(Path.cwd(), "cnab_nox", ".txt")
     )
@@ -177,6 +204,7 @@ def generate_cnab(
                 "alertas": len(batch.warnings),
                 "saida_extensao": destination.suffix.lower(),
                 "resultado": "txt_gerado",
+                "reconciliation": batch.reconciliation.to_audit_dict(),
             },
         )
     except OSError:
@@ -191,6 +219,7 @@ def generate_cnab(
         warning_count=len(result_warnings),
         warnings=tuple(result_warnings),
         compositions=_summarize_generated_compositions(batch.rows),
+        reconciliation=batch.reconciliation,
     )
 
 

@@ -138,7 +138,8 @@ def _write_summary(sheet, batch: PreparedBatch) -> None:
         ("PENDENCIAS_PFMI", len(batch.unknown_rows)),
         ("INSTRUCAO_1", "Revise todos os campos finais na aba CREDITOS."),
         ("INSTRUCAO_2", "Use INCLUIR_CNAB=SIM/NAO; vazio bloqueia a geração."),
-        ("INSTRUCAO_3", "APROVADO=SIM libera somente divergência material de nome."),
+        ("INSTRUCAO_3", "SIM_SISTEMA identifica aprovação automática rastreada; "
+         "audite os dados e decida INCLUIR_CNAB=SIM/NAO."),
         ("INSTRUCAO_4", "Não inclua, exclua ou duplique linhas."),
     )
     for row in rows:
@@ -283,9 +284,13 @@ def _write_credits(sheet, rows: list[PreparedRow]) -> None:
     sheet.freeze_panes = "D2"
     sheet.auto_filter.ref = sheet.dimensions
     yes_no = DataValidation(type="list", formula1='"SIM,NAO"', allow_blank=True)
-    approved = DataValidation(type="list", formula1='"SIM,NAO"', allow_blank=True)
-    composicao_approved = DataValidation(type="list", formula1='"SIM,NAO"', allow_blank=True)
-    selecao_manual_approved = DataValidation(type="list", formula1='"SIM,NAO"', allow_blank=True)
+    approved = DataValidation(type="list", formula1='"SIM,NAO,SIM_SISTEMA"', allow_blank=True)
+    composicao_approved = DataValidation(
+        type="list", formula1='"SIM,NAO,SIM_SISTEMA"', allow_blank=True,
+    )
+    selecao_manual_approved = DataValidation(
+        type="list", formula1='"SIM,NAO,SIM_SISTEMA"', allow_blank=True,
+    )
     # Só "SIM": não existe um "NAO" explícito para aprovar divergência de
     # valor - o padrão (vazio) já é o bloqueio; ver validation.py.
     divergencia_valor_approved = DataValidation(type="list", formula1='"SIM"', allow_blank=True)
@@ -543,7 +548,9 @@ def _canonical(value: Any) -> str:
     if isinstance(value, bool):
         return "b:" + str(int(value))
     if isinstance(value, (int, float, Decimal)):
-        return "m:" + format(Decimal(str(value)).normalize(), "f")
+        number = Decimal(str(value))
+        # Excel does not preserve the sign of zero on an XLSX round trip.
+        return "m:" + ("0" if number == 0 else format(number.normalize(), "f"))
     return "s:" + str(value)
 
 

@@ -6,6 +6,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from .reconciliation import BatchValidationSummary
+
 FINAL_FIELDS = (
     "DOC_CEDENTE",
     "NOME_CEDENTE",
@@ -127,11 +129,12 @@ CONTROL_FIELDS = (
     # sem ambiguidade (nome, documento na mesma falência, seleção manual por
     # documento, ou principal de composição já resolvido) mas o Valor
     # Aquisição do Analítico não fecha exatamente com o total do PFMI, o
-    # sistema nunca aceita automaticamente nem arredonda. Estes 3 campos são
+    # sistema registra ambos os valores para a reconciliação com tolerância.
+    # Estes 3 campos são
     # somente leitura, calculados na preparação sempre que essa divergência
     # existir (ficam vazios nos demais casos); DIVERGENCIA_VALOR_APROVADA e a
-    # justificativa são a única forma de liberar o uso do valor do PFMI no
-    # CNAB - nunca do Analítico, nunca uma média ou resíduo compensado. Uma
+    # justificativa são campos legados e não ultrapassam o limite configurado.
+    # Dentro da tolerância o CNAB usa a PFMI, com alerta e auditoria. Uma
     # aprovação nunca resolve identidade, nome ou documento por conta própria
     # (ver validation.py); em composição, precisa ser idêntica em todas as
     # linhas, além de COMPOSICAO_APROVADA=SIM continuar exigido.
@@ -319,3 +322,4 @@ class GenerationResult:
     warning_count: int
     warnings: tuple[str, ...]
     compositions: tuple[dict[str, Any], ...] = ()
+    reconciliation: BatchValidationSummary | None = None

@@ -89,6 +89,14 @@ def names_equivalent_under_confirmed_document(name_a: Any, name_b: Any) -> bool:
     return fold(name_a) == fold(name_b)
 
 
+def normalize_name_whitespace(value: Any) -> str:
+    text = "".join(
+        " " if char.isspace() else char
+        for char in str(value or "")
+    )
+    return " ".join(text.split())
+
+
 def technical_name(value: Any) -> str:
     text = strip_accents(str(value or "")).upper()
     if any(unicodedata.category(char).startswith("C") for char in text):

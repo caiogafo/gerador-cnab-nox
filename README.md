@@ -187,3 +187,91 @@ MANIFESTO são ocultas/protegidas; os campos necessários à revisão estão vis
 
 A proteção previne alterações acidentais e verifica integridade; não é assinatura
 criptográfica nem mecanismo contra adulteração deliberada de todos os controles.
+# Tolerância na reconciliação pré-TXT
+
+`MAX_TOLERANCE_DIFF_REAIS` define o limite **absoluto por operação reconciliada**,
+em reais, com padrão `100.00`. Informe decimal com ponto, não negativo e com até
+duas casas. Configuração inválida bloqueia a operação. Exemplo no PowerShell,
+antes de abrir a aplicação:
+
+```powershell
+$env:MAX_TOLERANCE_DIFF_REAIS = '100.00'
+```
+
+- Diferença zero: `PERFECT_MATCH`.
+- Diferença absoluta até o limite, inclusive: `TOLERATED_WARNING`. O TXT usa
+  o valor da PFMI, com aviso na interface e registro no log JSONL.
+- Acima do limite: `CRITICAL_ERROR`, sem gerar TXT, mesmo que os campos antigos
+  de aprovação de divergência estejam preenchidos. `0` configura fechamento exato.
+
+A tolerância não resolve identidade, documentos inválidos, ambiguidades ou
+aprovação de composição. Também não altera o fechamento dos valores nominais.
+Em composições, compara a soma dos componentes com o crédito compartilhado uma
+única vez e conserva o valor PFMI de cada componente. Não distribui diferenças
+entre vários créditos independentes que não tenham um valor PFMI individual.
+
+O resultado de geração expõe `reconciliation` (`BatchValidationSummary`), também
+presente no `ValidationError` quando a reconciliação foi realizada e bloqueou.
+O log `logs/gerador_cnab_nox.jsonl` registra o resumo, com valores inteiros em
+centavos, nos eventos de geração e bloqueio. `diffCents` e `totalDiffCents` usam
+PFMI menos Analítico; diferenças opostas não anulam bloqueios individuais.
+`clearedRecords` contém correspondências perfeitas; `warnings`, as toleradas.
+Os totais consideram os registros identificados e selecionados para a remessa.
+Outras pendências mantêm `canGenerateTxt=false`, mesmo sem divergência financeira.
+O retorno em memória contém documento normalizado e nome; os logs mantêm a
+proteção existente, com documentos mascarados e nomes omitidos, vinculados por ID.
+## STP: preenchimento automático com auditoria
+
+O match por CPF/CNPJ válido e idêntico nas fontes pode aprovar a divergência de
+nome com `APROVADO=SIM_SISTEMA` e `OK_COM_ALERTA_NOME`. Não substitui documentos
+por similaridade e continua respeitando a falência e a identidade do crédito.
+
+Para composições, o motor compara o total PFMI com o Analítico usando a tolerância
+configurada. Exige um único candidato de valor **antes** de conferir CPF/CNPJ ou
+nome. Dois candidatos, mesmo que só um pareça ter o nome certo, abortam a
+auto-aprovação com `COMPOSICAO_BLOQUEADA_SELECAO_MANUAL`. Uma correspondência
+única com documento ou nome forte preenche aba, linha e aprovações `SIM_SISTEMA`.
+Nomes abreviados exigem pelo menos dois tokens completos iniciais e metade dos
+tokens do nome maior; pequenas diferenças de grafia exigem primeiro token igual
+e similaridade mínima de 92%. Valor isolado não confirma identidade.
+
+Composições usam referências explícitas entre parênteses. Para o caso de advogado
+sem referência, `JOSE VALDIR` (ou identidade nas regras locais de advogado da
+falência) só se associa quando há um único titular no mesmo arquivo, aba, bloco
+físico e falência. O motor não testa combinações arbitrárias entre operações.
+
+O nominal é preenchido pela distribuição proporcional já existente, com soma
+exata e resíduo de centavos no titular. A composição automaticamente aprovada
+permanece `INCLUIR_CNAB=NAO` até a decisão do operador. Basta auditar e selecionar
+SIM/NAO para o grupo inteiro; inclusão parcial continua proibida. Operações
+inteiramente excluídas não bloqueiam as demais operações selecionadas.
+
+As regras, fontes e preenchimentos ficam em `ALERTAS` e no histórico protegido.
+Digitar `SIM_SISTEMA` não fabrica uma aprovação: a geração confere o snapshot
+original e invalida aprovações automáticas quando os dados aprovados são alterados.
+O TXT usa o intermediário sem reabrir o Analítico para seleções automáticas.
+
+Fallbacks de sacados são lidos de [EQUIVALENCIAS_FALENCIAS.md](docs/EQUIVALENCIAS_FALENCIAS.md).
+Herdam a data de liquidação do lote; os CNPJs de desenvolvimento cadastrados
+precisam ser substituídos por documentos reais válidos antes de uma remessa.
+### Intervenção humana: SIM prevalece sobre SIM_SISTEMA
+
+Zero digitação obrigatória não significa impedir edição. Para substituir um
+match, preencha `COMPOSICAO_SELECAO_MANUAL_ABA` e
+`COMPOSICAO_SELECAO_MANUAL_LINHA` com a localização correta do Analítico e marque
+`COMPOSICAO_APROVADA=SIM` em todas as linhas da composição. Para uma operação
+individual, use os mesmos campos de aba/linha e `APROVADO=SIM`.
+`SELECAO_MANUAL_APROVADA=SIM` também é uma assinatura humana válida da escolha.
+
+A seleção humana pode substituir um crédito automático anterior. Os campos
+finais digitados pelo operador são preservados. Valores automáticos ainda
+intocados são atualizados a partir do crédito escolhido (incluindo o rateio
+nominal exato); a geração registra `MANUAL_OVERRIDE=SIM` nos avisos.
+Para corrigir somente o nome, basta editar o nome e marcar `APROVADO=SIM`.
+Alterações manuais de valores de uma composição exigem `COMPOSICAO_APROVADA=SIM`.
+
+Uma nova escolha de aba/linha requer o Analítico disponível na configuração do
+lote. Seleções automáticas inalteradas usam o snapshot protegido, sem reabrir
+fontes. CPF/CNPJ, limite financeiro, soma dos nominais, unicidade do crédito e
+inclusão integral da composição continuam sendo validados. A origem protegida
+permanece preservada para comparar a decisão humana com a sugestão anterior.

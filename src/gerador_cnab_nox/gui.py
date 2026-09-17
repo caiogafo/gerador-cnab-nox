@@ -18,6 +18,7 @@ from .gui_messages import explain_issue, explain_pending, money
 from .gui_theme import configure_theme
 from .gui_widgets import Card, ResultPanel, ScrollableBody, paragraph
 from .models import CESSAO, NORMAL, PfmiInput
+from .reconciliation import reconcile_credit
 from .service import generate_cnab, prepare_workbook
 from .workbook import read_intermediate
 
@@ -76,8 +77,23 @@ def _composition_message(c: dict) -> str:
     nominal = (
         money(c["nominal_analitico"]) if c["nominal_analitico"] is not None else "indisponível"
     )
-    if c["estado"] == "PROPOSTA":
+    tolerated = (
+        c["estado"] == "BLOQUEADA_DIVERGENCIA_VALOR"
+        and c["total_pfmi"] is not None and c["total_analitico"] is not None
+        and reconcile_credit(
+            "", "", "", c["total_pfmi"], c["total_analitico"]
+        ).status == "TOLERATED_WARNING"
+    )
+    if c.get("auto_approved"):
+        prefixo = "Composição preenchida e aprovada pelo sistema"
+        rodape = (
+            "SIM_SISTEMA: audite os dados e decida INCLUIR_CNAB=SIM/NAO no Excel. "
+            "Aba, linha e aprovações já estão preenchidas e registradas em ALERTAS."
+        )
+    elif c["estado"] == "PROPOSTA" or tolerated:
         prefixo = "Composição encontrada — confira antes de aprovar"
+        if tolerated:
+            prefixo = "Composição com divergência tolerada — confira antes de aprovar"
         rodape = (
             "Esta sugestão não confirma identidade: confira o instrumento e aprove "
             "explicitamente em COMPOSICAO_APROVADA no Excel; enquanto isso os títulos "
@@ -90,8 +106,8 @@ def _composition_message(c: dict) -> str:
             "COMPOSICAO_CANDIDATOS (nome, documento mascarado, valor e linha) e, se "
             "você já conferiu o instrumento, informe a aba e a linha exatas do "
             "Analítico em COMPOSICAO_SELECAO_MANUAL_ABA/COMPOSICAO_SELECAO_MANUAL_LINHA "
-            "(iguais em todas as linhas da composição) no Excel; só é aceito se fechar "
-            "exatamente com a soma dos componentes."
+            "(iguais em todas as linhas da composição) no Excel. O valor também será "
+            "conferido com a soma dos componentes e a tolerância configurada."
         )
     else:
         prefixo = "Composição bloqueada"
@@ -942,8 +958,10 @@ class Application:
                 v["ID_GRUPO"], {"credor": v["NOME_CEDENTE_PFMI"], "ok": False, "pendencias": ""}
             )
             if (
-                v["STATUS"] == "OK" and v.get("INCLUIR_CNAB") == "SIM"
-                and (not v.get("COMPOSICAO_ID") or v.get("COMPOSICAO_APROVADA") == "SIM")
+                v["STATUS"] in {"OK", "OK_COM_ALERTA_NOME", "OK_COM_ALERTA_COMPOSICAO"}
+                and v.get("INCLUIR_CNAB") == "SIM"
+                and (not v.get("COMPOSICAO_ID")
+                     or v.get("COMPOSICAO_APROVADA") in {"SIM", "SIM_SISTEMA"})
             ):
                 g["ok"] = True
             elif not g["ok"]:
@@ -985,7 +1003,10 @@ class Application:
         composition_lines = tuple(
             _composition_message(c) for c in result.compositions
         )
-        aguardando = sum(1 for c in result.compositions if c["estado"] == "PROPOSTA")
+        aguardando = sum(
+            1 for c in result.compositions if c["estado"] == "PROPOSTA"
+            and not c.get("auto_approved")
+        )
         titulos_envolvidos = sum(len(c["component_ids"]) for c in result.compositions)
         # Três blocos separados visualmente (regra "Preenchimentos comprovados"
         # vs "Decisões que exigem conferência" vs pendências sem solução
@@ -993,6 +1014,7 @@ class Application:
         # etapa nova, só a reorganização do resumo pós-preparo.
         sections = ["── Preenchimentos comprovados (automáticos) ──"]
         sections.extend(preenchimentos_comprovados or ["Nenhum preenchimento nesta categoria."])
+        sections.extend(result.warnings)
         sugestoes = tuple(sugestoes_aguardando) + suggestion_lines + composition_lines
         sections.append("── Sugestões aguardando confirmação ──")
         sections.extend(sugestoes or ["Nenhuma sugestão aguardando confirmação."])
@@ -1001,7 +1023,7 @@ class Application:
         self.review_result.show(
             "Excel preparado",
             body,
-            kind="success" if not pendentes else "warning",
+            kind="warning" if pendentes or result.warnings else "success",
             issues=tuple(sections),
             details=result.warnings,
             metrics=(
@@ -1081,7 +1103,8 @@ class Application:
             "TXT salvo com sucesso",
             f"Sequência: {result.first_sequence}–{result.last_sequence} · "
             f"Avisos: {result.warning_count}",
-            kind="success",
+            kind="warning" if any("TOLERATED_WARNING" in w for w in result.warnings)
+            else "success",
             issues=tuple(explain_issue(v) for v in result.warnings) + composition_lines,
             details=result.warnings,
             metrics=(

@@ -547,17 +547,11 @@ def test_full_group_approval_is_internally_consistent(tmp_path):
     loaded = read_intermediate(path)
     # Aprovação consistente (todas as linhas da composição com o mesmo
     # COMPOSICAO_APROVADA e INCLUIR_CNAB=NAO) não deve, por si só, gerar
-    # nenhuma mensagem de inconsistência de composição. O lote inteiro ainda
-    # falha (regra pré-existente e inalterada: todo grupo precisa de um
-    # crédito selecionado antes de qualquer geração), mas por um motivo
-    # completamente diferente, já esperado sem composição nenhuma.
-    with pytest.raises(ValidationError) as excinfo:
-        validate_for_generation(loaded)
-    issues = excinfo.value.issues
-    assert not any("COMPOSICAO_APROVADA deve ser igual" in issue for issue in issues)
-    assert not any("INCLUIR_CNAB deve ser igual" in issue for issue in issues)
-    assert not any("geração de títulos por composição" in issue for issue in issues)
-    assert any("nenhum crédito selecionado" in issue for issue in issues)
+    # nenhuma mensagem de inconsistência. A decisão NAO exclui a composição
+    # inteira e permite gerar somente a outra operação selecionada.
+    validated = validate_for_generation(loaded)
+    assert len(validated.rows) == 1
+    assert validated.rows[0]["ID_LINHA"] == other_id
 
 
 # 14. Aprovação ou INCLUIR_CNAB parcial bloqueia ------------------------------
@@ -813,7 +807,8 @@ def test_gui_composition_message_is_transparent_and_never_asserts_identity():
     assert PRINCIPAL in message and REPRESENTANTE in message
 
 
-def test_gui_blocked_composition_message_says_blocked():
+def test_gui_blocked_composition_message_says_blocked(monkeypatch):
+    monkeypatch.setenv("MAX_TOLERANCE_DIFF_REAIS", "0")
     comp = {
         "participantes": PRINCIPAL,
         "total_pfmi": Decimal("100.01"),
@@ -905,10 +900,11 @@ def test_ordinary_group_matches_by_document_when_name_diverges_same_failure():
     )
     row = batch.rows[0].values
     assert row["ID_CREDITO"]  # achou o crédito por documento
-    assert row["INCLUIR_CNAB"] == "NAO"  # nunca automático
-    assert "SELECAO_MANUAL_NECESSARIA" in row["PENDENCIAS"]
-    assert "DIVERGENCIA_NOME" in row["PENDENCIAS"]
-    assert "CREDOR_LOCALIZADO_POR_DOCUMENTO" in row["PENDENCIAS"]
+    assert row["INCLUIR_CNAB"] == "SIM"
+    assert row["APROVADO"] == "SIM_SISTEMA"
+    assert row["STATUS"] == "OK_COM_ALERTA_NOME"
+    assert not row["PENDENCIAS"]
+    assert "DOCUMENTO_EXATO_NOME_DIVERGENTE" in row["ALERTAS"]
 
 
 def test_ordinary_document_fallback_never_crosses_failure():
@@ -1054,7 +1050,9 @@ def test_manual_selection_requires_exact_nominal_no_rounding(tmp_path):
     assert any("VL_NOMINAL" in issue for issue in excinfo.value.issues)
 
 
-def test_manual_selection_requires_exact_financial_closure(tmp_path):
+def test_manual_selection_requires_exact_financial_closure(tmp_path, monkeypatch):
+    # Strict-mode regression: zero tolerance preserves exact closure.
+    monkeypatch.setenv("MAX_TOLERANCE_DIFF_REAIS", "0")
     # Crédito cuja aquisição não fecha com o total do PFMI (100.00): bloqueia,
     # mesmo com documento exato e todas as aprovações presentes.
     batch = _cross_failure_batch()
@@ -1065,7 +1063,7 @@ def test_manual_selection_requires_exact_financial_closure(tmp_path):
     off_by_a_cent = _manual_credit(present="100.01")
     with pytest.raises(ValidationError) as excinfo:
         validate_for_generation(loaded, analytic=[off_by_a_cent])
-    assert any("não fecha exatamente" in issue for issue in excinfo.value.issues)
+    assert excinfo.value.reconciliation.errors[0].status == "CRITICAL_ERROR"
 
 
 def test_manual_selection_end_to_end_generates_real_txt(tmp_path):
@@ -1140,6 +1138,7 @@ def _composition_manual_edits(rows, aba, linha, **overrides):
         edit = {
             "COMPOSICAO_SELECAO_MANUAL_ABA": aba,
             "COMPOSICAO_SELECAO_MANUAL_LINHA": linha,
+            "SELECAO_MANUAL_APROVADA": "SIM",
             "COMPOSICAO_APROVADA": "SIM",
             "APROVADO": "SIM",
             "NOME_CEDENTE": CREDITO_ANALITICO_DIVERGENTE,
@@ -1371,7 +1370,9 @@ def test_composition_manual_location_reused_by_two_compositions_stays_blocked(tm
     )
 
 
-def test_composition_manual_location_one_cent_difference_stays_blocked(tmp_path):
+def test_composition_manual_location_one_cent_difference_stays_blocked(tmp_path, monkeypatch):
+    # Strict-mode regression: zero tolerance preserves exact closure.
+    monkeypatch.setenv("MAX_TOLERANCE_DIFF_REAIS", "0")
     # Soma dos componentes = 100.00; aquisicao do credito = 100.01: mesmo um
     # centavo de diferenca bloqueia, sem arredondamento nem tolerancia.
     batch = _unlocatable_composition_batch(acquisition="100.01")
@@ -1386,7 +1387,7 @@ def test_composition_manual_location_one_cent_difference_stays_blocked(tmp_path)
     )
     with pytest.raises(ValidationError) as excinfo:
         validate_for_generation(loaded, analytic=[credit])
-    assert any("não fecha exatamente" in issue for issue in excinfo.value.issues)
+    assert excinfo.value.reconciliation.errors[0].status == "CRITICAL_ERROR"
 
 
 def test_composition_approval_without_manual_location_still_blocked(tmp_path):
@@ -1461,7 +1462,9 @@ def test_case_without_divergence_has_blank_audit_fields_and_needs_no_approval(tm
     assert validated.rows[0]["VL_PRESENTE"] == Decimal("100.00")
 
 
-def test_ordinary_value_divergence_blocked_without_approval(tmp_path):
+def test_ordinary_value_divergence_blocked_without_approval(tmp_path, monkeypatch):
+    # Strict-mode regression: zero tolerance preserves exact closure.
+    monkeypatch.setenv("MAX_TOLERANCE_DIFF_REAIS", "0")
     batch = _prepare(
         [_pay(SOLO_PFMI, "100.01", doc=VALID_CPF)],
         [_credit("REF-1", SOLO_PFMI, acquisition="100.00", doc=VALID_CPF)],
@@ -1598,7 +1601,9 @@ def test_ordinary_credit_absent_cannot_be_approved_by_value_alone(tmp_path):
     )
 
 
-def test_ordinary_manual_document_value_divergence_blocked_without_approval(tmp_path):
+def test_ordinary_manual_document_value_divergence_blocked_without_approval(tmp_path, monkeypatch):
+    # Strict-mode regression: zero tolerance preserves exact closure.
+    monkeypatch.setenv("MAX_TOLERANCE_DIFF_REAIS", "0")
     # Identidade confirmada por documento (seleção manual, cruzando
     # falência), mas o valor diverge - continua bloqueado sem aprovação.
     batch = _cross_failure_batch()
@@ -1609,7 +1614,7 @@ def test_ordinary_manual_document_value_divergence_blocked_without_approval(tmp_
     credit = _manual_credit(present="100.01")  # Analítico diverge 1 centavo do PFMI (100.00)
     with pytest.raises(ValidationError) as excinfo:
         validate_for_generation(loaded, analytic=[credit])
-    assert any("não fecha exatamente" in issue for issue in excinfo.value.issues)
+    assert excinfo.value.reconciliation.errors[0].status == "CRITICAL_ERROR"
 
 
 def test_ordinary_manual_document_value_divergence_approved_successfully(tmp_path):
@@ -1672,7 +1677,9 @@ def _composition_divergence_edits(rows, **overrides):
     return edits
 
 
-def test_composition_value_divergence_blocked_without_approval(tmp_path):
+def test_composition_value_divergence_blocked_without_approval(tmp_path, monkeypatch):
+    # Strict-mode regression: zero tolerance preserves exact closure.
+    monkeypatch.setenv("MAX_TOLERANCE_DIFF_REAIS", "0")
     batch = _prepare(
         [_pay(PRINCIPAL, "60.00"), _pay(REPRESENTANTE, "39.99")],
         [_credit("REF-1", PRINCIPAL, acquisition="100.00")],
@@ -1816,7 +1823,11 @@ def test_divergencia_valor_pfmi_readonly_field_cannot_be_tampered(tmp_path):
 # V1-4) E o valor também diverge - as duas aprovações são independentes.
 
 
-def test_composition_manual_location_value_divergence_blocked_without_approval(tmp_path):
+def test_composition_manual_location_value_divergence_blocked_without_approval(
+    tmp_path, monkeypatch,
+):
+    # Strict-mode regression: zero tolerance preserves exact closure.
+    monkeypatch.setenv("MAX_TOLERANCE_DIFF_REAIS", "0")
     batch = _unlocatable_composition_batch(acquisition="100.01")
     comp = batch.compositions[0]
     assert comp["estado"] == "BLOQUEADA_CREDITO_NAO_LOCALIZADO"
@@ -1830,7 +1841,7 @@ def test_composition_manual_location_value_divergence_blocked_without_approval(t
     )
     with pytest.raises(ValidationError) as excinfo:
         validate_for_generation(loaded, analytic=[credit])
-    assert any("não fecha exatamente" in issue for issue in excinfo.value.issues)
+    assert excinfo.value.reconciliation.errors[0].status == "CRITICAL_ERROR"
 
 
 def test_composition_manual_location_value_divergence_approved_successfully(tmp_path):
@@ -2008,7 +2019,11 @@ def test_composition_satellite_internal_credito_nao_localizado_does_not_block_ge
     assert txt_out.exists()
 
 
-def test_composition_real_value_divergence_still_blocked_despite_shared_credit(tmp_path):
+def test_composition_real_value_divergence_still_blocked_despite_shared_credit(
+    tmp_path, monkeypatch,
+):
+    # Strict-mode regression: zero tolerance preserves exact closure.
+    monkeypatch.setenv("MAX_TOLERANCE_DIFF_REAIS", "0")
     # Confirma que a correção não libera divergência real de valor: quando a
     # soma não fecha (diferenca != 0), o estado nunca é PROPOSTA e os rótulos
     # internos continuam protegidos como antes - a composição segue bloqueada.

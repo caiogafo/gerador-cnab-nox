@@ -36,7 +36,39 @@ snapshot explícito. A interface lê o cadastro e captura esse snapshot antes de
 iniciar o processamento. Chamadas diretas sem esse parâmetro continuam usando
 somente as equivalências já existentes no produto.
 
-Esta entrega implementa o cadastro e seu uso nos cruzamentos. Não altera a
-comissão CONEX, não resolve a exceção de instrumentos separados e não aprova
-pessoas por similaridade. Candidatos de valor exato e mesma falência continuam
-disponíveis para seleção manual no intermediário conforme as regras existentes.
+O cadastro de equivalências é independente das heurísticas STP. O Smart Match
+usa candidato único por valor e evidência de documento/nome, com `SIM_SISTEMA`
+rastreável. O operador pode substituir essa escolha informando aba/linha e
+aprovação humana `SIM`; a comissão CONEX e as validações financeiras permanecem.
+# Fallback de sacados para STP
+
+A preparação lê exclusivamente o bloco JSON delimitado abaixo. CNPJs são
+normalizados para 14 dígitos. O vencimento de cada fallback recebe a **data de
+liquidação do lote**, com formato de célula Excel `DD/MM/YYYY`. A regra só atua
+quando a Base de Vencimentos não resolve o sacado de forma consistente.
+Cada injeção aparece em `ALERTAS` e no histórico protegido do intermediário.
+
+**Dados de desenvolvimento fornecidos pelo operador:** os dois CNPJs abaixo
+têm 14 dígitos, mas não passam no checksum. São preenchidos para testar o fluxo;
+a validação de geração permanece bloqueada até cadastrar CNPJs válidos confirmados.
+Não representam CNPJs reais verificados dessas massas falidas.
+
+<!-- CNAB_NOX_FALLBACKS_BEGIN -->
+```json
+{
+  "COSTEIRA": {
+    "cnpj": "48060297000107",
+    "nome": "MASSA FALIDA COSTEIRA TRANSPORTES"
+  },
+  "LP DISPLAYS": {
+    "cnpj": "04119093000129",
+    "nome": "MASSA FALIDA LP DISPLAYS BRASIL"
+  }
+}
+```
+<!-- CNAB_NOX_FALLBACKS_END -->
+
+Para uma instalação em outra pasta, `CNAB_NOX_EQUIVALENCIAS_PATH` aponta para
+este documento. Chamadas Python podem fornecer `fallback_document_path`.
+JSON inválido, chaves duplicadas normalizadas ou CNPJs com tamanho incorreto
+bloqueiam a preparação; o aplicativo não ignora silenciosamente um cadastro inválido.
