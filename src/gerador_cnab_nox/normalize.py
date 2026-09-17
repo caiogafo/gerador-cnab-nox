@@ -6,6 +6,12 @@ from datetime import date, datetime
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 from typing import Any
 
+CREDOR_ALIASES = {
+    # Mapeamento do Agenor (ajuste o valor da direita para o nome exato no Analítico)
+    "AGENOR LUIZ DE SOUZA FILHO": "AGENOR LUIZ DE SOUZA", 
+    "MARIA ANGELICA NALIN 2": "MARIA ANGELICA NALIN",
+}
+
 CENT = Decimal("0.01")
 MAX_MONEY = Decimal("99999999999.99")
 # Aggregate source values do not occupy an individual CNAB monetary field.
@@ -20,19 +26,29 @@ def header_key(value: Any) -> str:
 
 
 def strip_accents(value: str) -> str:
-    normalized = unicodedata.normalize("NFKD", value)
+    normalized = unicodedata.normalize("NFKD", str(value or ""))
     return "".join(char for char in normalized if not unicodedata.combining(char))
 
-
 def normalize_name(value: Any) -> str:
+    # 1. Padronização primária
     text = strip_accents(str(value or "")).upper()
+    
+    # 2. Limpeza de prefixos jurídicos (Espólios)
+    padrao_prefixos = r'^(ESPOLIO(?:\s+DE)?\.?|INVENTARIANTE(?:\s+DE)?\.?|ESP\.?\s+DE)\s+'
+    text = re.sub(padrao_prefixos, "", text)
+
+    # 3. Substituições corporativas contratuais
     for pattern, replacement in (
         (r"(?<![A-Z0-9])L\s*\.\s*T\s*\.\s*D\s*\.\s*A\s*\.?(?![A-Z0-9])", "LTDA"),
         (r"(?<![A-Z0-9])C\s*\.\s*I\s*\.\s*A\s*\.?(?![A-Z0-9])", "CIA"),
         (r"(?<![A-Z0-9])S\s*[./]\s*A\s*\.?(?![A-Z0-9])", "SA"),
     ):
         text = re.sub(pattern, f" {replacement} ", text)
-    text = re.sub(r"[^A-Z0-9]+", " ", text)
+
+    # 4. Remoção de caracteres especiais
+    text = re.sub(r"[^A-Z0-9]+", " ", text).strip()
+
+    # 5. Tratamento de tokens
     tokens = text.split()
     canonical: list[str] = []
     index = 0
@@ -45,6 +61,7 @@ def normalize_name(value: Any) -> str:
         token = tokens[index]
         canonical.append({"LIMITADA": "LTDA", "COMPANHIA": "CIA"}.get(token, token))
         index += 1
+
     return " ".join(canonical)
 
 
@@ -110,11 +127,12 @@ def technical_name(value: Any) -> str:
         raise ValueError("nome incompatível com Windows-1252") from exc
     return text
 
-
 def normalize_failure(value: Any) -> str:
     name = normalize_name(value)
-    return {"MOGIANO": "MOGIANO TRANSP GERAIS"}.get(name, name)
-
+    return {
+        "MOGIANO": "MOGIANO TRANSP GERAIS",
+        "KELETI": "KELETI ENGENHARIA",
+    }.get(name, name)
 
 def commission_rate(value: Any, modality: str) -> Decimal:
     if modality == "NORMAL":

@@ -22,6 +22,28 @@ def test_persistence_chains_and_removal(tmp_path):
     assert load_aliases(path) == {}
 
 
+def test_builtin_equivalence_can_be_saved_and_does_not_block_other_entries(tmp_path):
+    path = tmp_path / "aliases.json"
+    values = {"  keleti  ": "KELETI ENGENHARIA", "MOGIANO": "MOGIANO TRANSP GERAIS"}
+    save_aliases(values, path)
+    loaded = load_aliases(path)
+    assert loaded["KELETI"] == "KELETI ENGENHARIA"
+    save_aliases({**loaded, "OUTRA": "OUTRA ENGENHARIA"}, path)
+    resolve = resolver(load_aliases(path))
+    assert resolve("keleti") == "KELETI ENGENHARIA"
+    assert resolve("MOGIANO") == "MOGIANO TRANSP GERAIS"
+    assert resolve("OUTRA") == "OUTRA ENGENHARIA"
+
+
+@pytest.mark.parametrize("values", [
+    {"KELETI": "OUTRA", "KELETI ENGENHARIA": "TERCEIRA"},
+    {"KELETI": "OUTRA", "OUTRA": "KELETI ENGENHARIA"},
+])
+def test_builtin_canonical_conflicts_and_cycles_remain_blocked(values):
+    with pytest.raises(InputFileError):
+        validate_aliases(values)
+
+
 @pytest.mark.parametrize("values", [
     {"A": "B", "B": "A"}, {"A": "A"}, {"": "B"}, {"A": None},
     {"Á": "B", "a": "C"}, [],

@@ -97,8 +97,11 @@ def lawyer_name(value, failure, rules):
     # No rule for this failure -> "" -> falls through to manual review.
     prefix = str(value or "").split("(", 1)[0].strip()
     key = normalize_name(prefix)
-    identities = rules.get(normalize_failure(failure), ())
-    if any(key == identity or key.startswith(identity + " ") for identity in identities):
+    identities = [
+        normalize_name(identity) for identity in rules.get(normalize_failure(failure), ())
+    ]
+    if any(identity and (key == identity or key.startswith(identity + " "))
+           for identity in identities):
         return prefix
     return ""
 
@@ -110,7 +113,8 @@ def is_lawyer_case(failure, rules):
 def lawyer_identity(value, failure, rules):
     name = normalize_name(lawyer_name(value, failure, rules))
     for identity in rules.get(normalize_failure(failure), ()):
-        if name.startswith(identity):
+        identity = normalize_name(identity)
+        if identity and (name == identity or name.startswith(identity + " ")):
             return identity
     return ""
 

@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 from .errors import InputFileError
-from .normalize import normalize_failure
+from .normalize import normalize_failure, normalize_name
 
 
 def default_path() -> Path:
@@ -23,9 +23,23 @@ def validate_aliases(values):
     for source, target in values.items():
         if not isinstance(source, str) or not isinstance(target, str):
             raise InputFileError("Informe nomes de falência em texto.")
-        key, value = normalize_failure(source), normalize_failure(target)
+        key, value = normalize_name(source), normalize_name(target)
         if not key or not value or key == value:
             raise InputFileError("Informe dois nomes de falência diferentes e não vazios.")
+        if key in normalized and normalized[key] != value:
+            raise InputFileError("A mesma falência possui destinos conflitantes.")
+        normalized[key] = value
+    _resolved_aliases(normalized)
+    return normalized
+
+
+def _resolved_aliases(values):
+    """Compose local aliases with built-ins without storing canonical self-loops."""
+    normalized = {}
+    for source, target in values.items():
+        key, value = normalize_failure(source), normalize_failure(target)
+        if key == value:
+            continue
         if key in normalized and normalized[key] != value:
             raise InputFileError("A mesma falência possui destinos conflitantes.")
         normalized[key] = value
@@ -74,7 +88,7 @@ def save_aliases(values, path=None):
 
 
 def resolver(values):
-    aliases = validate_aliases(values)
+    aliases = _resolved_aliases(validate_aliases(values))
 
     def resolve(name):
         key = normalize_failure(name)

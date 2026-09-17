@@ -34,5 +34,17 @@ def test_editor_requires_confirmation_persists_and_removes(tmp_path):
         editor.remove()
         assert load_aliases(path) == {}
         assert len(changes) == 2
+        editor.source.set("KELETI")
+        editor.target.set("KELETI ENGENHARIA")
+        editor.confirmed.set(True)
+        editor.save()
+        assert load_aliases(path) == {"KELETI": "KELETI ENGENHARIA"}
+        assert len(editor.tree.get_children()) == 1
+        editor.source.set("OUTRA")
+        editor.target.set("OUTRA ENGENHARIA")
+        editor.confirmed.set(True)
+        editor.save()
+        assert len(load_aliases(path)) == 2
+        assert len(changes) == 4
     finally:
         root.destroy()

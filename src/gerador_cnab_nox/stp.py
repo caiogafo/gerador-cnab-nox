@@ -59,64 +59,36 @@ def infer_block_references(groups, existing, failure_key, lawyer_rules):
 
 
 def smart_candidate(principal, components, analytic, calculation, total):
-    """
-    Arquitetura Refatorada (Sendero): Resolve colisões de entidade usando 
-    tie-breaker financeiro e flexibilização inteligente de nomes (Soft Match) 
-    quando o valor comprova a unicidade do crédito.
-    """
+    """Require one financial candidate before checking independent identity evidence."""
     if principal.first.modality == CESSAO or total is None:
         return None, "MODALIDADE_OU_TOTAL_NAO_SUPORTADO"
-    
     if len({(g.first.modality, g.first.commission_text) for g in components}) != 1:
         return None, "PARAMETROS_DOS_COMPONENTES_DIVERGENTES"
-        
+
     candidates = []
     limit = tolerance_cents()
-    
-    # 1. Filtro Financeiro Inicial (Aplica Tolerância)
     for credit in analytic:
         expected = calculation(credit, principal)[3]
         if expected is None or expected < 0:
             continue
-            
         result = reconcile_credit("", "", "", total, expected, limit_cents=limit)
         if result.status != "CRITICAL_ERROR":
             candidates.append(credit)
-            
-    # 2. Resolução de Ambiguidade (Tie-Breaker)
     if not candidates:
         return None, "VALOR_NAO_LOCALIZADO"
-        
-    valid_candidates = []
-    for credit in candidates:
-        doc_match = confirmed_document(principal, credit)
-        name_match = strong_name_match(principal.first.cedent_name, credit.cedent_name)
-        
-        # Soft Match (Remove ruídos comuns de PFMI para não perder a âncora)
-        nome_pfmi_limpo = str(principal.first.cedent_name).upper().replace("ESPÓLIO DE", "").replace("ESPOLIO DE", "").strip()
-        nome_analitico_limpo = str(credit.cedent_name).upper().replace("ESPÓLIO DE", "").replace("ESPOLIO DE", "").strip()
-        
-        # Se um nome contiver o outro (ignorando o sufixo " 1" e "Espólio")
-        soft_match = (nome_analitico_limpo in nome_pfmi_limpo) or (nome_pfmi_limpo in nome_analitico_limpo)
-        
-        if doc_match or name_match or soft_match:
-            valid_candidates.append(credit)
+    if len(candidates) > 1:
+        return None, "VALOR_AMBIGUO"
 
-    # 3. Decisão e Aprovação Automática
-    if len(valid_candidates) == 1:
-        credit = valid_candidates[0]
-        if validate_document(credit.cedent_document)[1] is None:
-            return None, "DOCUMENTO_ANALITICO_INVALIDO"
-        if not credit.source_sheet or credit.source_row < 2:
-            return None, "LOCALIZACAO_ANALITICO_AUSENTE"
-            
-        motivo = "DOCUMENTO_EXATO" if confirmed_document(principal, credit) else "NOME_FORTE_OU_SOFT_MATCH"
-        return credit, motivo
-        
-    elif len(valid_candidates) > 1:
-        return None, "VALOR_E_NOME_AMBIGUOS"
-    else:
+    credit = candidates[0]
+    doc_match = confirmed_document(principal, credit)
+    if not doc_match and not strong_name_match(principal.first.cedent_name, credit.cedent_name):
         return None, "IDENTIDADE_INSUFICIENTE"
+    if validate_document(credit.cedent_document)[1] is None:
+        return None, "DOCUMENTO_ANALITICO_INVALIDO"
+    if not credit.source_sheet or credit.source_row < 2:
+        return None, "LOCALIZACAO_ANALITICO_AUSENTE"
+    return credit, "DOCUMENTO_EXATO" if doc_match else "NOME_FORTE"
+
 
 def audit_fill(values, field, value, rule, source):
     records = json.loads(values.get("PREENCHIMENTOS_AUTOMATICOS") or "[]")

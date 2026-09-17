@@ -7,6 +7,7 @@ import pytest
 from gerador_cnab_nox.normalize import (
     digits,
     money,
+    normalize_failure,
     normalize_name,
     parse_date,
     parse_positive_int,
@@ -21,6 +22,18 @@ def test_explicit_name_equivalences() -> None:
     assert normalize_name("Acme Companhia") == normalize_name("ACME C.I.A.")
     assert normalize_name("Acme Limitada") == normalize_name("ACME L.T.D.A.")
     assert normalize_name("MARIA E JOAO") != normalize_name("MARIA JOAO")
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("KELETI", "KELETI ENGENHARIA"),
+    ("  keleti  ", "KELETI ENGENHARIA"),
+    ("KELETI ENGENHARIA", "KELETI ENGENHARIA"),
+    ("MOGIANO", "MOGIANO TRANSP GERAIS"),
+    ("BANCO SANTOS", "BANCO SANTOS"),
+    ("BIANCO", "BIANCO"),
+])
+def test_failure_aliases(value, expected):
+    assert normalize_failure(value) == expected
 
 
 def test_documents_and_integral_float() -> None:

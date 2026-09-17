@@ -237,6 +237,24 @@ def test_t11_mogiano_three_sources_and_no_fuzzy_failure():
     assert b.rows[0].values["ID_CREDITO"] == ""
 
 
+def test_keleti_quirino_matches_canonical_analytic_failure():
+    from dataclasses import replace
+
+    name = "QUIRINO DANTAS DA ROCHA"
+    payment = replace(_payment("B1", "100"), failure="  keleti  ", cedent_name=name)
+    credit = replace(_credit("A", "100"), campaign="KELETI ENGENHARIA", cedent_name=name)
+    due = replace(_due(), debtor_name="KELETI ENGENHARIA")
+    batch = prepare_batch(
+        PfmiData(payments=[payment]), [credit], [due],
+        liquidation_date=date(2026, 9, 17), first_sequence=1,
+    )
+    row = batch.rows[0].values
+    assert row["STATUS"] == "OK"
+    assert row["INCLUIR_CNAB"] == "SIM"
+    assert row["ID_CREDITO"]
+    assert not row["PENDENCIAS"]
+
+
 def test_t12_individual_alternative_requires_manual_selection():
     from dataclasses import replace
 

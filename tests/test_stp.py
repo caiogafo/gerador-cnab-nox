@@ -177,9 +177,8 @@ def test_invalid_fallback_config_blocks(tmp_path, document):
 
 
 def test_development_cnpjs_are_filled_but_do_not_bypass_checksum(tmp_path):
-    config = load_fallbacks()
+    config = load_fallbacks(_fallback_file(tmp_path, "00000000000100"))
     assert config["COSTEIRA"]["document"] == "00000000000100"
-    assert config["LP DISPLAYS"]["document"] == "00000000000200"
     batch = prepare_batch(
         PfmiData(payments=[_pay("TITULAR", "100", failure="COSTEIRA")]),
         [_credit("A", "TITULAR", failure="COSTEIRA")], [],
