@@ -319,7 +319,7 @@ def test_preparation_composition_summary_completes_on_tk_thread(
     assert not app.activity_label.winfo_ismapped()
     assert len(app.review_result.metrics_frame.winfo_children()) == 6
     assert app.review_result.metric_summary == (
-        "operações: 2 · prontas: 0 · pendentes: 2 · composições encontradas: 1 · "
+        "operações: 2 · prontas: 2 · pendentes: 0 · composições encontradas: 1 · "
         "títulos envolvidos: 2 · composições aguardando aprovação: 0"
     )
     text = app.review_result.issue_text.get("1.0", "end")
@@ -333,7 +333,7 @@ def test_preparation_composition_summary_completes_on_tk_thread(
                    app.open_excel_button, app.continue_generate_button):
         assert str(button.cget("state")) == "normal"
     loaded = real_read(target)
-    assert all(r.values["COMPOSICAO_APROVADA"] == "SIM_SISTEMA" for r in loaded.rows)
+    assert all(r.values["COMPOSICAO_APROVADA"] == "SIM" for r in loaded.rows)
 
 
 def test_prepared_summary_survives_blank_pendencias_after_nominal_suggestion(

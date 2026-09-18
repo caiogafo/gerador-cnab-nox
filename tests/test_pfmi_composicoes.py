@@ -901,7 +901,7 @@ def test_ordinary_group_matches_by_document_when_name_diverges_same_failure():
     row = batch.rows[0].values
     assert row["ID_CREDITO"]  # achou o crédito por documento
     assert row["INCLUIR_CNAB"] == "SIM"
-    assert row["APROVADO"] == "SIM_SISTEMA"
+    assert row["APROVADO"] == "SIM"
     assert row["STATUS"] == "OK_COM_ALERTA_NOME"
     assert not row["PENDENCIAS"]
     assert "DOCUMENTO_EXATO_NOME_DIVERGENTE" in row["ALERTAS"]

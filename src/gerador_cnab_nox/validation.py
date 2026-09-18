@@ -24,7 +24,7 @@ from .normalize import (
     validate_document,
 )
 from .reconciliation import BatchValidationSummary, reconcile_credit, summarize, tolerance_cents
-from .stp import SYSTEM_APPROVAL, system_approval_valid
+from .stp import SYSTEM_APPROVAL, has_system_approval, system_approval_valid
 from .workbook import LoadedIntermediate, _canonical
 
 
@@ -739,7 +739,7 @@ def _resolve_composition_manual_selections(
         composicao_id = _override_key(prepared.originals)
         snapshot_location = bool(
             prepared.originals.get("ID_CREDITO")
-            and prepared.originals.get("SELECAO_MANUAL_APROVADA") == SYSTEM_APPROVAL
+            and has_system_approval(prepared.originals, "SELECAO_MANUAL_APROVADA")
             and system_approval_valid(
                 prepared.values, prepared.originals, "SELECAO_MANUAL_APROVADA",
             )

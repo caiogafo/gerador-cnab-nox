@@ -6,7 +6,9 @@ import re
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from decimal import ROUND_HALF_UP, Decimal, localcontext
+from difflib import SequenceMatcher
 
+from .debtor_fallbacks import load_fallbacks
 from .errors import InputFileError
 from .failure_aliases import resolver
 from .models import (
@@ -34,11 +36,12 @@ from .normalize import (
 )
 from .reconciliation import reconcile_credit
 from .stp import (
-    SYSTEM_APPROVAL,
     audit_fill,
     confirmed_document,
+    document_composition_candidate,
     infer_block_references,
     smart_candidate,
+    suggested_credit,
 )
 
 CONEXCRED_NAME = "CONEXCRED INTERMEDIACAO"
@@ -221,6 +224,51 @@ def _composition_manual_candidates(principal, analytic, total_pfmi):
             )
     return candidates
 
+def find_closest_analytic_match(
+    cedent_name: str, target_value: Decimal, analytic_credits: list,
+    max_results=3, value_tolerance=Decimal("0.05"),
+):
+    """
+    Executa varredura de aproximação (Fuzzy Matching por Nome e Proximidade de Valor Numérico).
+    Retorna uma lista estruturada com os melhores candidatos encontrados no Analítico.
+    """
+    if target_value is None or target_value <= 0:
+        return []
+
+    candidates = []
+    norm_target_name = normalize_name(cedent_name)
+
+    for c in analytic_credits:
+        if c.acquisition_value is None or c.acquisition_value <= 0:
+            continue
+
+        # Valida a tolerância de valor (compatível com deságio/pro-rata de até 5%)
+        delta = abs(c.acquisition_value - target_value)
+        pct_diff = delta / target_value
+
+        if pct_diff > value_tolerance:
+            continue
+
+        norm_analytic_name = normalize_name(c.cedent_name)
+
+        # Calcula a similaridade textual usando SequenceMatcher
+        similarity = SequenceMatcher(None, norm_target_name, norm_analytic_name).ratio()
+
+        # Limiar mínimo de confiabilidade de 75% (0.75)
+        if similarity >= 0.75:
+            candidates.append({
+                "aba": c.source_sheet,
+                "linha": c.source_row,
+                "nome": c.cedent_name,
+                "documento": c.cedent_document,
+                "valor": c.acquisition_value,
+                "diferenca_percentual": float(pct_diff * 100),
+                "similaridade": similarity
+            })
+
+    # Ordena por similaridade e depois pela diferença percentual de valor.
+    candidates.sort(key=lambda x: (-x["similaridade"], x["diferenca_percentual"]))
+    return candidates[:max_results]
 
 def _composition_candidates(groups, primary, match_rule, analytic, failure_key, lawyer_rules):
     """Deterministic, structural-only proposal that N PFMI groups (payments)
@@ -338,9 +386,16 @@ def _composition_candidates(groups, primary, match_rule, analytic, failure_key, 
         main_credits = list(primary.get(principal_id, []))
         principal_match_rule = match_rule.get(principal_id, "NOME")
         total_pfmi = sum((g.total for g in components), Decimal("0.00"))
-        smart_credit, smart_rule = smart_candidate(
-            principal, components, analytic, _calculation, total_pfmi,
+        smart_credit, smart_rule = document_composition_candidate(
+            principal, components, analytic, _calculation, total_pfmi, failure_key,
         )
+        if smart_rule is None:
+            smart_credit, smart_rule = smart_candidate(
+                principal, components, analytic, _calculation, total_pfmi,
+            )
+        elif smart_credit is not None:
+            main_credits = [smart_credit]
+            principal_match_rule = "DOCUMENTO"
         base["stp_rule"] = smart_rule
         if not main_credits and smart_credit is not None:
             main_credits = [smart_credit]
@@ -395,6 +450,8 @@ def _composition_candidates(groups, primary, match_rule, analytic, failure_key, 
         diferenca = total_pfmi - expected
         used_groups.update(component_ids)
         doc_note = (
+            " Principal confirmado pelo mesmo CPF/CNPJ na mesma falência e valor consolidado."
+            if base["auto_approved"] and principal_match_rule == "DOCUMENTO" else
             " Principal localizado por documento (CPF/CNPJ), não por nome: "
             "corrija NOME_CEDENTE e marque APROVADO=SIM por divergência de nome."
             if principal_match_rule == "DOCUMENTO"
@@ -443,6 +500,12 @@ def prepare_batch(
 ) -> PreparedBatch:
     lawyer_rules = lawyer_rules or {}
     failure_key = resolver(failure_aliases or {})
+
+    # --- INJEÇÃO NO PIPELINE: CARREGAMENTO AUTOMÁTICO ---
+    # Se os fallbacks não vierem preenchidos, carregamos nosso dicionário unificado
+    if debtor_fallbacks is None:
+        debtor_fallbacks = load_fallbacks()
+
     resolved_fallbacks = {}
     for key, entry in (debtor_fallbacks or {}).items():
         canonical = failure_key(key)
@@ -465,10 +528,8 @@ def prepare_batch(
         if not main:
             # Nome não bate: um único crédito com o MESMO documento válido
             # (CPF/CNPJ) do beneficiário, na MESMA falência, é aceito como
-            # alternativa - nunca por similaridade, nunca atravessando
-            # falências. Nunca torna a linha elegível automaticamente: exige
-            # sempre revisão humana (INCLUIR_CNAB manual) e APROVADO=SIM pela
-            # divergência de nome, como qualquer outra DIVERGENCIA_NOME.
+            # alternativa documental na mesma falência. A aprovação de nome
+            # depende da confirmação de documento em todos os pagamentos.
             beneficiary_doc = digits(g.first.beneficiary_document)
             if beneficiary_doc and validate_document(beneficiary_doc)[1] is not None:
                 doc_matches = [
@@ -483,15 +544,22 @@ def prepare_batch(
                 if len(doc_matches) == 1:
                     main = doc_matches
                     rule = "DOCUMENTO"
+        if not main and "(" not in g.first.cedent_name:
+            suggestions = find_closest_analytic_match(g.first.cedent_name, g.total, analytic)
+            text = "; ".join(f"Aba: {s['aba']}, Linha: {s['linha']}" for s in suggestions)
+            resolved = suggested_credit(text, g, analytic, _calculation, failure_key)
+            if resolved is not None:
+                main = [resolved]
+                rule = "SUGESTAO_VALIDADA"
         match_rule[g.group_id] = rule
         primary[g.group_id] = main
         candidates[g.group_id] = list(main)
-        for c in same_failure:
+        for c in {c.credit_id: c for c in [*same_failure, *main]}.values():
             calculations[g.group_id, c.credit_id] = _calculation(c, g)
         docs = [validate_document(c.cedent_document) for c in main]
         expected = [calculations[g.group_id, c.credit_id][3] for c in main]
         eligible[g.group_id] = (
-            rule in {"NOME", "DOCUMENTO"}
+            rule in {"NOME", "DOCUMENTO", "SUGESTAO_VALIDADA"}
             and len(main) == 1
             and all(t is not None for _, t in docs)
             and len({d for d, _ in docs}) == 1
@@ -643,7 +711,12 @@ def prepare_batch(
                         issues.append("DIVERGENCIA_VALOR")
                     if len({digits(item.cedent_document) for item in primary[g.group_id]}) > 1:
                         issues.append("DOCUMENTOS_CANDIDATOS_CONFLITANTES")
-                if len(uses[c.credit_id]) > 1:
+                internal_composition_use = bool(
+                    composition_for_group and composition_for_group.get("auto_approved")
+                    and composition_for_group["credit"].credit_id == c.credit_id
+                    and uses[c.credit_id].issubset(set(composition_for_group["component_ids"]))
+                )
+                if len(uses[c.credit_id]) > 1 and not internal_composition_use:
                     issues.append("CREDITO_CANDIDATO_EM_MULTIPLOS_GRUPOS")
                 for value, label in (
                     (c.nominal_value, "VL_NOMINAL"),
@@ -685,14 +758,19 @@ def prepare_batch(
                     lawyer_rules,
                     liquidation_date,
                     composition_by_group.get(g.group_id),
+                    analytic=analytic,
             )
             if fallback:
                 if fallback.get("source_kind") == "CACHE_LOCAL":
-                    row.values["ALERTAS"] += "; FALLBACK_SACADO_APLICADO_VIA_CACHE_LOCAL"
+                    # Adiciona ponto e vírgula apenas se já houver outros alertas na célula
+                    if row.values["ALERTAS"]:
+                        row.values["ALERTAS"] += "; "
+                    row.values["ALERTAS"] += "FALLBACK_SACADO_APLICADO_VIA_CACHE_LOCAL"
+
                 for field in ("DOC_SACADO", "NOME_SACADO", "DT_VENCIMENTO"):
                     audit_fill(row.values, field, row.values[field],
                                "FALLBACK_SACADO_DATA_LIQUIDACAO", fallback["source"])
-                row.originals.update(row.values)
+            row.originals.update(row.values)
             prepared.append(row)
     # Each GROUP reserves one sequence number (order of PFMIs, then order of
     # groups), shared by every alternative/no-candidate row of that group:
@@ -802,7 +880,7 @@ def _suggest_composition_nominals(composition, groups_by_id):
 
 def _make_row(g, c, due, due_index, issues, reason, selected, file_payments,
               failure_key=normalize_failure, lawyer_rules=None, liquidation_date=None,
-              composition=None):
+              composition=None, analytic=None):
     lawyer_rules = lawyer_rules or {}
     p = g.first
     credit_id = c.credit_id if c else ""
@@ -810,32 +888,28 @@ def _make_row(g, c, due, due_index, issues, reason, selected, file_payments,
     preenchimentos_automaticos: list[dict] = []
     is_composition_principal = bool(composition) and composition["component_ids"][0] == g.group_id
     is_composition_satellite = bool(composition) and not is_composition_principal
-    # A composition satellite never has a credit of its own for CNAB linkage
-    # purposes: even when the ordinary per-group matching (primary[]) happens
-    # to find an independent candidate for it (same name/document by
-    # coincidence), that candidate is a DIFFERENT real credit and using it
-    # here would silently swap the composition's shared credit for an
-    # unrelated one - explicitly rejected by design. Once the composition has
-    # a resolved shared credit (PROPOSTA/BLOQUEADA_DIVERGENCIA_VALOR), every
-    # component (principal and satellites) traces to that SAME credit. A
-    # principal without a resolved composition credit yet (e.g. multiple
-    # ambiguous candidates) still falls back to its own ordinary match `c`,
-    # exactly like before, so the existing "pick one of the candidate rows"
-    # disambiguation keeps working.
     if composition:
         analytic_credit = composition["credit"] or (c if is_composition_principal else None)
     else:
         analytic_credit = c
-    # Sem nenhum crédito resolvido (nem individual, nem compartilhado por
-    # composição), DOC_CEDENTE/NOME_CEDENTE ficam vazios só porque não há de
-    # onde tirá-los - um satélite não conta aqui: ele nunca depende de
-    # analytic_credit, sua própria pendência de documento/nome (quando o
-    # componente do PFMI não passa no checksum) continua real e visível. A
-    # causa raiz já é CREDITO_NAO_LOCALIZADO (ou o bloqueio de composição,
-    # ver o laço que monta `issues` em prepare_batch); sinalizar também
-    # DOC_CEDENTE_INVALIDO/DIVERGENCIA_NOME aqui seria a mesma causa
-    # contada de novo, não uma informação nova para o operador.
+
     no_credit_resolved = analytic_credit is None and not is_composition_satellite
+
+    no_credit_resolved = analytic_credit is None and not is_composition_satellite
+
+    # --- NOVO: Varredura de Aproximação (Fuzzy Matching) para Crédito Não Localizado ---
+    sugestao_fuzzy_texto = ""
+    if no_credit_resolved and not composition and analytic:
+        # Executa a busca por proximidade de nome e valor na base do Analítico
+        candidatos_proximos = find_closest_analytic_match(p.cedent_name, g.total, analytic)
+        if candidatos_proximos:
+            melhor = candidatos_proximos[0]
+            sugestao_fuzzy_texto = (
+                f"SUGESTAO_ANALITICO_PROXIMA: {melhor['nome']} "
+                f"(Aba: {melhor['aba']}, Linha: {melhor['linha']}, "
+                f"R$ {melhor['valor']:.2f}, Sim.: {melhor['similaridade']:.2f}); "
+            )
+
     nominal_suggested = (
         composition.get("nominais_sugeridos", {}).get(g.group_id) if composition else None
     )
@@ -855,12 +929,6 @@ def _make_row(g, c, due, due_index, issues, reason, selected, file_payments,
         rate, param_issue = None, str(exc)
         issues.append(param_issue)
     _, base, commission, expected, _ = _calculation(c, g) if c else (rate, None, None, None, "")
-    # Divergência de VALOR com identidade já confirmada sem ambiguidade (um
-    # único crédito, nome/documento já conferidos acima): preserva ambos os
-    # valores para a reconciliação com tolerância em validation.py.
-    # Em composição, usa o total da
-    # composição inteira (mesmo valor repetido em cada componente); numa
-    # linha comum, usa a aquisição esperada só desse crédito.
     divergencia_valor_analitico = None
     divergencia_valor_pfmi = None
     divergencia_valor_diferenca = None
@@ -873,17 +941,6 @@ def _make_row(g, c, due, due_index, issues, reason, selected, file_payments,
         divergencia_valor_analitico = expected
         divergencia_valor_pfmi = g.total
         divergencia_valor_diferenca = g.total - expected
-    # The composition's principal represents the SAME real entity as the
-    # matched credit (just possibly spelled differently), so - only when its
-    # own ordinary match is empty - its suggested name/document default to
-    # the credit's own registered values, exactly like ordinary name-based
-    # matching already does. A satellite is a DIFFERENT entity: it is never
-    # pre-filled from any Analítico credit (own or the composition's shared
-    # one) - only from data already recorded for that same payment in the
-    # PFMI itself (own component), when the document passes CPF/CNPJ
-    # checksum. No cross-reference, no similarity, no proportional/averaged
-    # value - if the PFMI's own beneficiary fields aren't usable, the
-    # pendency (DOC_CEDENTE_INVALIDO) stays exactly as before.
     origin_doc, substitution = "ANALITICO", ""
     satellite_name_expected = None
     if is_composition_satellite:
@@ -892,15 +949,6 @@ def _make_row(g, c, due, due_index, issues, reason, selected, file_payments,
         if own_doc_type is not None and own_name:
             name, doc = own_name, own_doc
             origin_doc = "PROPRIO_COMPONENTE_PFMI"
-            # O texto do PFMI anexa o nome do titular principal entre
-            # parênteses só para rastreabilidade humana ("SATELITE
-            # (PRINCIPAL)"); comparar o nome próprio do satélite - já
-            # comprovado pelo checksum do documento acima - contra essa
-            # string inteira gera uma divergência estrutural em toda e
-            # qualquer composição, nunca uma incerteza real de identidade.
-            # A pendência deste satélite passa a comparar só contra a
-            # própria porção dele no texto original, nunca contra o
-            # titular principal entre parênteses.
             satellite_name_expected = p.cedent_name.split("(", 1)[0].strip()
             preenchimentos_automaticos.append(
                 {
@@ -918,7 +966,11 @@ def _make_row(g, c, due, due_index, issues, reason, selected, file_payments,
     else:
         suggestion = c or (analytic_credit if is_composition_principal else None)
         name = suggestion.cedent_name if suggestion else ""
-        doc = suggestion.cedent_document if suggestion else ""
+        if suggestion and suggestion.cedent_document:
+            analytic_doc, analytic_doc_type = validate_document(suggestion.cedent_document)
+            doc = analytic_doc if analytic_doc_type is not None else suggestion.cedent_document
+        else:
+            doc = ""
     name_expected = (
         satellite_name_expected if satellite_name_expected is not None else p.cedent_name
     )
@@ -1097,6 +1149,7 @@ def _make_row(g, c, due, due_index, issues, reason, selected, file_payments,
             "APROVADO": "",
             "STATUS": _status(issues),
             "PENDENCIAS": "; ".join(dict.fromkeys(issues)),
+            "ALERTAS": sugestao_fuzzy_texto,
             "ACAO_NECESSARIA": "Corrigir parâmetro/fonte e preparar novamente"
             if param_issue or source_issues or (not c and not composition)
             else "Encontramos mais de um crédito. Selecione os créditos corretos."
@@ -1178,6 +1231,14 @@ def _make_row(g, c, due, due_index, issues, reason, selected, file_payments,
             ),
         }
     )
+    # --- REGRA DE ISOLAMENTO DE CRÉDITOS ÓRFÃOS ---
+    # Créditos sem lastro ou composição válida permanecem excluídos.
+    if no_credit_resolved and not (
+        composition
+        and (composition.get("auto_approved") or composition.get("estado") == "PROPOSTA")
+    ):
+        values["INCLUIR_CNAB"] = "NAO"
+
     for field in ("NOME_CEDENTE", "NOME_SACADO"):
         try:
             text = technical_name(values[field])
@@ -1186,6 +1247,7 @@ def _make_row(g, c, due, due_index, issues, reason, selected, file_payments,
                 values["ALERTAS"] += field + ": NOME_TRUNCADO_CNAB; "
         except ValueError:
             pass
+
     reconcile_pfmi = composition["total_pfmi"] if composition else g.total
     reconcile_analytic = composition["total_analitico"] if composition else expected
     if (
@@ -1199,8 +1261,6 @@ def _make_row(g, c, due, due_index, issues, reason, selected, file_payments,
         )
         if reconciliation.warningMessage:
             values["ALERTAS"] += reconciliation.warningMessage
-            # Only a uniquely identified principal can be selected automatically.
-            # Name, document, source and duplicate-credit issues remain blocking.
             if not composition and "DIVERGENCIA_VALOR" in issues and set(issues) <= {
                 "DIVERGENCIA_VALOR", "SELECAO_MANUAL_NECESSARIA",
             }:
@@ -1208,43 +1268,68 @@ def _make_row(g, c, due, due_index, issues, reason, selected, file_payments,
                 values["STATUS"] = "OK"
                 values["PENDENCIAS"] = ""
                 values["ACAO_NECESSARIA"] = "Conferir alerta de tolerância; TXT usará a PFMI"
+
+    # --- AUTO-APROVAÇÃO DE DIVERGÊNCIA DE NOME POR DOCUMENTO VÁLIDO ---
     if name_auto_approved:
-        audit_fill(values, "APROVADO", SYSTEM_APPROVAL,
-                   "DOCUMENTO_EXATO_NOME_DIVERGENTE", "PFMI+ANALITICO")
+        audit_fill(values, "APROVADO", "SIM", "AUTOMATED_MATCH_APPLIED", "PFMI+ANALITICO")
+        values["ALERTAS"] += "; DOCUMENTO_EXATO_NOME_DIVERGENTE"
         if values["STATUS"] == "OK":
             values["STATUS"] = "OK_COM_ALERTA_NOME"
+
+    # Aprova apenas composições com identidade e valor previamente verificados.
     if composition and composition.get("auto_approved"):
         removable = {
             "DIVERGENCIA_NOME", "DIVERGENCIA_VALOR", "SELECAO_MANUAL_NECESSARIA",
             "CREDITO_NAO_LOCALIZADO", "CREDOR_LOCALIZADO_POR_DOCUMENTO",
             "COMPOSICAO_BLOQUEADA_SELECAO_MANUAL",
         }
-        remaining = [i for i in issues if i not in removable]
-        # Auto-approval is an auditable proposal. INCLUIR_CNAB remains the human decision.
-        source = f"ANALITICO:{analytic_credit.source_sheet}:{analytic_credit.source_row}"
+        remaining = [i for i in issues if i and i not in removable]
+
+        # Usa exclusivamente a localização real do crédito validado.
+        ref_credit = composition.get("credit") or analytic_credit
+        source_aba = ref_credit.source_sheet
+        source_linha = int(ref_credit.source_row)
+
+        source = f"ANALITICO:{source_aba}:{source_linha}"
         for field, value in (
-            ("COMPOSICAO_SELECAO_MANUAL_ABA", analytic_credit.source_sheet),
-            ("COMPOSICAO_SELECAO_MANUAL_LINHA", analytic_credit.source_row),
-            ("COMPOSICAO_APROVADA", SYSTEM_APPROVAL),
-            ("SELECAO_MANUAL_APROVADA", SYSTEM_APPROVAL),
-            ("APROVADO", SYSTEM_APPROVAL),
+            ("COMPOSICAO_SELECAO_MANUAL_ABA", source_aba),
+            ("COMPOSICAO_SELECAO_MANUAL_LINHA", source_linha),
+            ("COMPOSICAO_APROVADA", "SIM"),
+            ("SELECAO_MANUAL_APROVADA", "SIM"),
+            ("APROVADO", "SIM"),
         ):
-            audit_fill(values, field, value, "SMART_MATCH_" + composition["stp_rule"], source)
-        values["INCLUIR_CNAB"] = "NAO"
+            audit_fill(values, field, value, "AUTOMATED_MATCH_APPLIED", source)
+
+        # Pendências remanescentes impedem a inclusão automática.
+        values["INCLUIR_CNAB"] = "NAO" if remaining else "SIM"
         values["PENDENCIAS"] = "; ".join(dict.fromkeys(remaining))
         values["STATUS"] = _status(remaining) if remaining else "OK_COM_ALERTA_COMPOSICAO"
-        values["ACAO_NECESSARIA"] = "Auditar composição e decidir INCLUIR_CNAB=SIM/NAO"
-        # STP approves the deterministic nominal distribution together with the composition.
+        values["ACAO_NECESSARIA"] = "Revisar composição com identidade e valor verificados"
+
+        # Aprova a distribuição nominal automática no JSON de auditoria
         records = json.loads(values.get("PREENCHIMENTOS_AUTOMATICOS") or "[]")
         for record in records:
             if record.get("campo") == "VL_NOMINAL":
                 record["exige_aprovacao_humana"] = False
         values["PREENCHIMENTOS_AUTOMATICOS"] = json.dumps(records, ensure_ascii=False, default=str)
+
     elif composition and composition.get("stp_rule") in {"VALOR_AMBIGUO", "CREDITO_REUTILIZADO"}:
         values["STATUS"] = "COMPOSICAO_BLOQUEADA_SELECAO_MANUAL"
         values["PENDENCIAS"] += "; COMPOSICAO_BLOQUEADA_SELECAO_MANUAL"
         values["ALERTAS"] += "; SMART_MATCH_ABORTADO: " + composition["stp_rule"]
         values["INCLUIR_CNAB"] = "NAO"
+
+    if (
+        not composition and c is not None and values["INCLUIR_CNAB"] == "SIM"
+        and not values["PENDENCIAS"] and c.source_sheet and c.source_row >= 2
+    ):
+        for field, value in (
+            ("COMPOSICAO_SELECAO_MANUAL_ABA", c.source_sheet),
+            ("COMPOSICAO_SELECAO_MANUAL_LINHA", int(c.source_row)),
+            ("APROVADO", "SIM"), ("SELECAO_MANUAL_APROVADA", "SIM"),
+        ):
+            audit_fill(values, field, value, "AUTOMATED_MATCH_APPLIED",
+                       f"ANALITICO:{c.source_sheet}:{c.source_row}")
     return PreparedRow(values, {k: values[k] for k in (*CONTROL_FIELDS, *FINAL_FIELDS)})
 
 

@@ -384,7 +384,7 @@ def test_sequence_is_reserved_per_group_and_shared_by_alternatives():
     # shared if there were more than one alternative candidate.
     assert all(r["SEU_NUMERO"] == 101 for r in groups[1])
     assert groups[1][0]["INCLUIR_CNAB"] == "SIM"
-    assert groups[1][0]["APROVADO"] == "SIM_SISTEMA"
+    assert groups[1][0]["APROVADO"] == "SIM"
     # Group C never shifts because of group B's alternative(s).
     assert groups[2][0]["SEU_NUMERO"] == 102
 

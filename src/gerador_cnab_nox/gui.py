@@ -88,7 +88,7 @@ def _composition_message(c: dict) -> str:
     if c.get("auto_approved"):
         prefixo = "Composição preenchida e aprovada pelo sistema"
         rodape = (
-            "SIM_SISTEMA: audite os dados e decida INCLUIR_CNAB=SIM/NAO no Excel. "
+            "Aprovações e inclusão preenchidas com SIM; revise e altere para NAO se necessário. "
             "Aba, linha e aprovações já estão preenchidas e registradas em ALERTAS."
         )
     elif c["estado"] == "PROPOSTA" or tolerated:
@@ -970,7 +970,6 @@ class Application:
             )
             if (
                 v["STATUS"] in {"OK", "OK_COM_ALERTA_NOME", "OK_COM_ALERTA_COMPOSICAO"}
-                and v.get("INCLUIR_CNAB") == "SIM"
                 and (not v.get("COMPOSICAO_ID")
                      or v.get("COMPOSICAO_APROVADA") in {"SIM", "SIM_SISTEMA"})
             ):
@@ -1010,9 +1009,24 @@ class Application:
             f"= {money(s['total'])} · possível crédito no Analítico: "
             + ", ".join(c["referencia"] for c in s["creditos_encontrados"])
             for s in result.related_suggestions
+            if not any(
+                c.get("auto_approved")
+                and {s["grupo_a"], s["grupo_b"]}.issubset(c["component_ids"])
+                for c in result.compositions
+            )
         )
         composition_lines = tuple(
-            _composition_message(c) for c in result.compositions
+            _composition_message(c) for c in result.compositions if not c.get("auto_approved")
+        )
+        preenchimentos_comprovados.extend(
+            _composition_message(c) for c in result.compositions if c.get("auto_approved")
+        )
+        inclusion_decisions = tuple(
+            "Composição resolvida: " + c["participantes"]
+            + ". Resta decidir INCLUIR_CNAB=SIM/NAO; nenhum preenchimento adicional."
+            for c in result.compositions if c.get("auto_approved")
+            and any(v.values.get("INCLUIR_CNAB") != "SIM" for v in loaded_rows
+                    if v.values.get("COMPOSICAO_ID") == c["composicao_id"])
         )
         aguardando = sum(
             1 for c in result.compositions if c["estado"] == "PROPOSTA"
@@ -1025,8 +1039,10 @@ class Application:
         # etapa nova, só a reorganização do resumo pós-preparo.
         sections = ["── Preenchimentos comprovados (automáticos) ──"]
         sections.extend(preenchimentos_comprovados or ["Nenhum preenchimento nesta categoria."])
-        sections.extend(result.warnings)
-        sugestoes = tuple(sugestoes_aguardando) + suggestion_lines + composition_lines
+        sections.extend(w for w in result.warnings if "SMART_MATCH_ABORTADO" not in w)
+        sugestoes = (
+            tuple(sugestoes_aguardando) + suggestion_lines + composition_lines + inclusion_decisions
+        )
         sections.append("── Sugestões aguardando confirmação ──")
         sections.extend(sugestoes or ["Nenhuma sugestão aguardando confirmação."])
         sections.append("── Pendências sem solução automática ──")

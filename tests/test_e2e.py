@@ -112,6 +112,7 @@ def test_name_divergence_needs_per_row_approval(tmp_path: Path, source_files) ->
     sheet = workbook["CREDITOS"]
     headers = {cell.value: cell.column for cell in sheet[1]}
     sheet.cell(2, headers["NOME_CEDENTE"]).value = "NOME DIFERENTE"
+    sheet.cell(2, headers["APROVADO"]).value = ""
     workbook.save(excel)
     workbook.close()
     with pytest.raises(ValidationError, match="DIVERGENCIA_NOME"):

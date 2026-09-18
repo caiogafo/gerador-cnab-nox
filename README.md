@@ -223,14 +223,15 @@ proteção existente, com documentos mascarados e nomes omitidos, vinculados por
 ## STP: preenchimento automático com auditoria
 
 O match por CPF/CNPJ válido e idêntico nas fontes pode aprovar a divergência de
-nome com `APROVADO=SIM_SISTEMA` e `OK_COM_ALERTA_NOME`. Não substitui documentos
+nome com `APROVADO=SIM` e `OK_COM_ALERTA_NOME`. Não substitui documentos
 por similaridade e continua respeitando a falência e a identidade do crédito.
 
 Para composições, o motor compara o total PFMI com o Analítico usando a tolerância
-configurada. Exige um único candidato de valor **antes** de conferir CPF/CNPJ ou
-nome. Dois candidatos, mesmo que só um pareça ter o nome certo, abortam a
-auto-aprovação com `COMPOSICAO_BLOQUEADA_SELECAO_MANUAL`. Uma correspondência
-única com documento ou nome forte preenche aba, linha e aprovações `SIM_SISTEMA`.
+configurada. Primeiro procura um crédito único com CPF/CNPJ confirmado, mesma
+falência e valor compatível. Sem essa prova documental, o Smart Match exige um
+único candidato de valor antes de conferir o nome forte. Ambiguidades nessa
+seleção mantêm `COMPOSICAO_BLOQUEADA_SELECAO_MANUAL`. Uma correspondência
+comprovada preenche aba, linha e aprovações `SIM`.
 Nomes abreviados exigem pelo menos dois tokens completos iniciais e metade dos
 tokens do nome maior; pequenas diferenças de grafia exigem primeiro token igual
 e similaridade mínima de 92%. Valor isolado não confirma identidade.
@@ -242,14 +243,19 @@ físico e falência. O motor não testa combinações arbitrárias entre operaç
 
 O nominal é preenchido pela distribuição proporcional já existente, com soma
 exata e resíduo de centavos no titular. A composição automaticamente aprovada
-permanece `INCLUIR_CNAB=NAO` até a decisão do operador. Basta auditar e selecionar
-SIM/NAO para o grupo inteiro; inclusão parcial continua proibida. Operações
+sai com `INCLUIR_CNAB=SIM` quando não há outras pendências. O operador pode
+alterar para NAO no grupo inteiro; inclusão parcial continua proibida. Operações
 inteiramente excluídas não bloqueiam as demais operações selecionadas.
 
-As regras, fontes e preenchimentos ficam em `ALERTAS` e no histórico protegido.
-Digitar `SIM_SISTEMA` não fabrica uma aprovação: a geração confere o snapshot
-original e invalida aprovações automáticas quando os dados aprovados são alterados.
-O TXT usa o intermediário sem reabrir o Analítico para seleções automáticas.
+As regras, fontes e preenchimentos ficam em `ALERTAS` e no histórico protegido,
+com a marca `AUTOMATED_MATCH_APPLIED`. Sugestões textuais só são aplicadas após
+conferir a linha real, identidade, falência, valor e unicidade na base. Texto de
+alerta sozinho não autoriza um pagamento. Órfãos e ambiguidades continuam bloqueados.
+O TXT usa o intermediário sem reabrir o Analítico para seleções automáticas intactas.
+Aprovações antigas `SIM_SISTEMA` continuam exigindo a assinatura protegida original.
+`SIM` continua aceitando a decisão humana; alterações são submetidas às validações
+de geração e registradas. A aprovação não distingue uma edição humana mantendo SIM
+de uma nova assinatura SIM; revise os campos alterados antes de gerar o TXT.
 
 Fallbacks de sacados combinam [EQUIVALENCIAS_FALENCIAS.md](docs/EQUIVALENCIAS_FALENCIAS.md)
 com o cadastro local, que tem prioridade sobre o documento histórico.

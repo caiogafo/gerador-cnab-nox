@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from difflib import SequenceMatcher
 
@@ -58,6 +59,39 @@ def infer_block_references(groups, existing, failure_key, lawyer_rules):
     return references
 
 
+def document_composition_candidate(
+    principal, components, analytic, calculation, total, failure_key,
+):
+    """Resolve a known document within its failure before attempting a value-based search."""
+    if principal.first.modality == CESSAO or total is None:
+        return None, None
+    if len({(g.first.modality, g.first.commission_text) for g in components}) != 1:
+        return None, None
+    identities = [
+        credit for credit in analytic
+        if failure_key(credit.campaign) == failure_key(principal.first.failure)
+        and confirmed_document(principal, credit)
+    ]
+    if not identities:
+        return None, None
+    limit = tolerance_cents()
+    candidates = []
+    for credit in identities:
+        expected = calculation(credit, principal)[3]
+        if expected is not None and expected >= 0 and reconcile_credit(
+            "", "", "", total, expected, limit_cents=limit,
+        ).status != "CRITICAL_ERROR":
+            candidates.append(credit)
+    if len(candidates) > 1:
+        return None, "VALOR_AMBIGUO"
+    if not candidates:
+        return None, "DOCUMENTO_VALOR_DIVERGENTE"
+    credit = candidates[0]
+    if not credit.source_sheet or credit.source_row < 2:
+        return None, "LOCALIZACAO_ANALITICO_AUSENTE"
+    return credit, "DOCUMENTO_FALENCIA_VALOR_UNICOS"
+
+
 def smart_candidate(principal, components, analytic, calculation, total):
     """Require one financial candidate before checking independent identity evidence."""
     if principal.first.modality == CESSAO or total is None:
@@ -103,7 +137,7 @@ def audit_fill(values, field, value, rule, source):
 
 def system_approval_valid(values, originals, field):
     """An editable marker cannot manufacture system provenance or approve new edits."""
-    if originals.get(field) != SYSTEM_APPROVAL:
+    if not has_system_approval(originals, field):
         return False
     if field == "APROVADO":
         fields = ["NOME_CEDENTE", "DOC_CEDENTE"]
@@ -115,3 +149,57 @@ def system_approval_valid(values, originals, field):
     from .workbook import _canonical
 
     return all(_canonical(values.get(k)) == _canonical(originals.get(k)) for k in fields)
+
+
+def has_system_approval(originals, field):
+    if originals.get(field) == SYSTEM_APPROVAL:
+        return True
+    if originals.get(field) != "SIM":
+        return False
+    try:
+        records = json.loads(originals.get("PREENCHIMENTOS_AUTOMATICOS") or "[]")
+        return any(r.get("campo") == field and r.get("valor_sugerido") == "SIM"
+                   and r.get("regra") == "AUTOMATED_MATCH_APPLIED" for r in records)
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def suggested_credit(text, group, analytic, calculation, failure_key):
+    """A parsed location is a lead, never sufficient evidence for approval."""
+    locations = {(sheet.strip(), int(row)) for sheet, row in re.findall(
+        r"Aba:\s*([^\r\n,]+?)\s*,\s*Linha:\s*(\d+)\b", text, flags=re.IGNORECASE,
+    )}
+    if not locations or group.total is None:
+        return None
+
+    def failure_tokens(value):
+        tokens = normalize_name(failure_key(value)).split()
+        while len(tokens) > 2 and tokens[-1] in {"SA", "LTDA"}:
+            tokens.pop()
+        return tokens
+
+    compatible = []
+    for credit in analytic:
+        if failure_tokens(credit.campaign) != failure_tokens(group.first.failure):
+            continue
+        same_doc = confirmed_document(group, credit)
+        same_name = normalize_name(credit.cedent_name) == normalize_name(group.first.cedent_name)
+        if not (same_doc or (group.first.modality == CESSAO and same_name)):
+            continue
+        expected = calculation(credit, group)[3]
+        if expected is None or expected < 0 or reconcile_credit(
+            "", "", "", group.total, expected,
+        ).status == "CRITICAL_ERROR":
+            continue
+        compatible.append(credit)
+    if len(compatible) != 1:
+        return None
+    credit = compatible[0]
+    location = (credit.source_sheet, credit.source_row)
+    if location not in locations or credit.source_row < 2 or not credit.source_sheet:
+        return None
+    if sum((c.source_sheet, c.source_row) == location for c in analytic) != 1:
+        return None
+    if validate_document(credit.cedent_document)[1] is None:
+        return None
+    return credit

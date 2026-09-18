@@ -56,10 +56,10 @@ def test_maria_and_jose_generated_excel_needs_only_binary_decision(tmp_path):
     for row in batch.rows:
         assert row.values["COMPOSICAO_SELECAO_MANUAL_ABA"] == "Analitico"
         assert row.values["COMPOSICAO_SELECAO_MANUAL_LINHA"] == 2918
-        assert row.values["COMPOSICAO_APROVADA"] == SYSTEM_APPROVAL
-        assert row.values["APROVADO"] == SYSTEM_APPROVAL
-        assert row.values["INCLUIR_CNAB"] == "NAO"
-        assert "SIM_SISTEMA" in row.values["ALERTAS"]
+        assert row.values["COMPOSICAO_APROVADA"] == "SIM"
+        assert row.values["APROVADO"] == "SIM"
+        assert row.values["INCLUIR_CNAB"] == "SIM"
+        assert "AUTOMATED_MATCH_APPLIED" in row.values["ALERTAS"]
     assert [r.values["VL_NOMINAL"] for r in batch.rows] == [Decimal(32000), Decimal(16000)]
     path = _save_and_include(batch, tmp_path)
     # No Analitico or PFMI source is reopened during generation.
@@ -77,7 +77,7 @@ def test_strong_document_autofills_name_approval(name, tmp_path):
         liquidation_date=date(2026, 9, 17), first_sequence=1,
     )
     row = batch.rows[0]
-    assert row.values["APROVADO"] == SYSTEM_APPROVAL
+    assert row.values["APROVADO"] == "SIM"
     assert row.values["STATUS"] == "OK_COM_ALERTA_NOME"
     assert not row.values["PENDENCIAS"]
     result = generate_cnab(_save_and_include(batch, tmp_path), output_path=tmp_path / "out.txt")
@@ -92,7 +92,7 @@ def test_ambiguous_value_aborts_before_document_or_name_disambiguation(offset):
                 source_sheet="Analitico", source_row=3),
     ]
     batch = _batch(candidates)
-    assert all(r.values["COMPOSICAO_APROVADA"] != SYSTEM_APPROVAL for r in batch.rows)
+    assert all(r.values["COMPOSICAO_APROVADA"] not in {"SIM", SYSTEM_APPROVAL} for r in batch.rows)
     assert all(r.values["STATUS"] == "COMPOSICAO_BLOQUEADA_SELECAO_MANUAL" for r in batch.rows)
 
 
@@ -101,8 +101,51 @@ def test_value_alone_never_proves_identity():
         _credit("A", "PESSOA TOTALMENTE DIFERENTE", acquisition="24000", doc=VALID_CPF,
                 source_sheet="Analitico"),
     ])
-    assert not any(r.values["COMPOSICAO_APROVADA"] == SYSTEM_APPROVAL for r in batch.rows)
+    assert all(r.values["COMPOSICAO_APROVADA"] not in {"SIM", SYSTEM_APPROVAL} for r in batch.rows)
     assert not strong_name_match("MARIA", "MARIA ANGELICA")
+
+
+def test_exact_document_composition_ignores_unrelated_equal_values(tmp_path):
+    batch = _batch([
+        _credit("CONFIRMED", "NOME CADASTRAL DIFERENTE", acquisition="24000", nominal="48000",
+                doc=VALID_CNPJ, source_sheet="Analitico", source_row=10),
+        _credit("OTHER", "OUTRO TITULAR", acquisition="24000", doc=VALID_CPF,
+                source_sheet="Analitico", source_row=11),
+    ])
+    assert batch.compositions[0]["auto_approved"]
+    for row in batch.rows:
+        assert row.values["COMPOSICAO_APROVADA"] == "SIM"
+        assert row.values["COMPOSICAO_SELECAO_MANUAL_LINHA"] == 10
+        assert not row.values["PENDENCIAS"]
+        assert not any(e.get("exige_aprovacao_humana")
+                       for e in json.loads(row.values["PREENCHIMENTOS_AUTOMATICOS"])
+                       if e["campo"] == "VL_NOMINAL")
+    result = generate_cnab(_save_and_include(batch, tmp_path), output_path=tmp_path / "out.txt")
+    assert result.detail_count == 2
+    assert result.total_present == Decimal(24000)
+
+
+@pytest.mark.parametrize("offset", ["0", "50"])
+def test_same_document_two_compatible_credits_still_require_selection(offset):
+    batch = _batch([
+        _credit("A", "MARIA ANGELICA", acquisition="24000", doc=VALID_CNPJ,
+                source_sheet="Analitico", source_row=10),
+        _credit("B", "MARIA ANGELICA", acquisition=str(Decimal(24000) + Decimal(offset)),
+                doc=VALID_CNPJ, source_sheet="Analitico", source_row=11),
+    ])
+    assert not batch.compositions[0]["auto_approved"]
+    assert all(r.values["COMPOSICAO_APROVADA"] not in {"SIM", SYSTEM_APPROVAL} for r in batch.rows)
+
+
+def test_exact_document_composition_selects_only_same_failure():
+    batch = _batch([
+        _credit("A", "MARIA ANGELICA", acquisition="24000", doc=VALID_CNPJ,
+                source_sheet="Analitico", source_row=10),
+        _credit("B", "MARIA ANGELICA", acquisition="24000", doc=VALID_CNPJ,
+                failure="OUTRA FALENCIA", source_sheet="Analitico", source_row=11),
+    ])
+    assert batch.compositions[0]["auto_approved"]
+    assert all(r.values["COMPOSICAO_SELECAO_MANUAL_LINHA"] == 10 for r in batch.rows)
 
 
 @pytest.mark.parametrize("field", ["block_id", "source_sheet", "file_id"])
@@ -136,6 +179,10 @@ def test_typed_system_approval_without_provenance_is_rejected(tmp_path, field):
 ])
 def test_edit_cannot_inherit_system_approval(tmp_path, field, value):
     loaded = read_intermediate(_save_and_include(_batch(), tmp_path))
+    # Compatibility with protected snapshots produced before SIM auto-assignment.
+    for row in loaded.rows:
+        for approval in ("APROVADO", "COMPOSICAO_APROVADA", "SELECAO_MANUAL_APROVADA"):
+            row.values[approval] = row.originals[approval] = SYSTEM_APPROVAL
     loaded.rows[0].values[field] = value
     with pytest.raises(ValidationError, match="campos aprovados alterados"):
         validate_for_generation(loaded)
@@ -192,6 +239,8 @@ def test_development_cnpjs_are_filled_but_do_not_bypass_checksum(tmp_path):
 
 def test_binary_no_excludes_whole_operation_without_blocking_other_credits(tmp_path):
     batch = _batch()
+    for row in batch.rows:
+        row.values["INCLUIR_CNAB"] = "NAO"
     other = prepare_batch(
         PfmiData(payments=[_pay("OUTRA OPERACAO", "100", block="B0002")]),
         [_credit("OTHER", "OUTRA OPERACAO")], [_due()],
