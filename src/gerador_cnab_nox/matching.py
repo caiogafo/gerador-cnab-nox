@@ -687,6 +687,8 @@ def prepare_batch(
                     composition_by_group.get(g.group_id),
             )
             if fallback:
+                if fallback.get("source_kind") == "CACHE_LOCAL":
+                    row.values["ALERTAS"] += "; FALLBACK_SACADO_APLICADO_VIA_CACHE_LOCAL"
                 for field in ("DOC_SACADO", "NOME_SACADO", "DT_VENCIMENTO"):
                     audit_fill(row.values, field, row.values[field],
                                "FALLBACK_SACADO_DATA_LIQUIDACAO", fallback["source"])
@@ -749,7 +751,7 @@ def _index_due_base(records, failure_key=normalize_failure):
 def _resolve_due(index, failure, failure_key=normalize_failure):
     records = index.get(failure_key(failure), [])
     if not records:
-        return "PREENCHER_MANUALMENTE", None, ["SACADO_NAO_LOCALIZADO"]
+        return "PREENCHER_MANUALMENTE", None, ["SACADO_NAO_CADASTRADO_NO_SISTEMA"]
     distinct = {}
     for r in records:
         key = (normalize_failure(r.debtor_name), digits(r.debtor_document), r.due_date)

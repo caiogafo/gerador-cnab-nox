@@ -12,6 +12,10 @@ def money(value: Decimal) -> str:
 
 _PENDING_MESSAGES = (
     (
+        "SACADO_NAO_CADASTRADO_NO_SISTEMA",
+        "Abra Cadastro de sacados, informe o CNPJ e o nome oficial e prepare um novo Excel.",
+    ),
+    (
         "CREDITO_NAO_LOCALIZADO",
         "Não encontramos um crédito individual com o mesmo valor. Confira o instrumento.",
     ),

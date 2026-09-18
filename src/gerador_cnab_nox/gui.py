@@ -14,6 +14,7 @@ from .advogado_rules import load_rules as load_lawyer_rules
 from .errors import UserFacingError, ValidationError
 from .failure_aliases import load_aliases
 from .gui_aliases import AliasEditor
+from .gui_debtors import DebtorEditor
 from .gui_messages import explain_issue, explain_pending, money
 from .gui_theme import configure_theme
 from .gui_widgets import Card, ResultPanel, ScrollableBody, paragraph
@@ -418,6 +419,8 @@ class Application:
             data_card, "Equivalências de falência", self._edit_aliases
         )
         self.aliases_button.pack(anchor="w", pady=(4, 8))
+        self.debtors_button = self._button(data_card, "Cadastro de sacados", self._edit_debtors)
+        self.debtors_button.pack(anchor="w", pady=(0, 8))
         sources = ttk.Frame(data_card)
         sources.pack(fill="x")
         sources.columnconfigure(1, weight=1)
@@ -872,6 +875,14 @@ class Application:
             (self.move_down_button, 0 <= index < len(children) - 1),
         ):
             button.configure(state="normal" if possible and not self.is_busy else "disabled")
+
+    def _edit_debtors(self):
+        if self.is_busy:
+            return
+        try:
+            self.debtor_editor = DebtorEditor(self.root, self._aliases_saved)
+        except (UserFacingError, OSError) as exc:
+            messagebox.showerror("Cadastro de sacados indisponível", str(exc), parent=self.root)
 
     def _edit_aliases(self):
         if self.is_busy:

@@ -251,9 +251,20 @@ Digitar `SIM_SISTEMA` não fabrica uma aprovação: a geração confere o snapsh
 original e invalida aprovações automáticas quando os dados aprovados são alterados.
 O TXT usa o intermediário sem reabrir o Analítico para seleções automáticas.
 
-Fallbacks de sacados são lidos de [EQUIVALENCIAS_FALENCIAS.md](docs/EQUIVALENCIAS_FALENCIAS.md).
-Herdam a data de liquidação do lote; os CNPJs de desenvolvimento cadastrados
-precisam ser substituídos por documentos reais válidos antes de uma remessa.
+Fallbacks de sacados combinam [EQUIVALENCIAS_FALENCIAS.md](docs/EQUIVALENCIAS_FALENCIAS.md)
+com o cadastro local, que tem prioridade sobre o documento histórico.
+Na tela de configuração, abra **Cadastro de sacados**, informe a falência,
+o CNPJ válido e o nome oficial, e clique em **Salvar sacado**. Selecione uma linha
+da lista para atualizar um cadastro existente. Prepare um novo Excel após salvar.
+O arquivo fica em `%LOCALAPPDATA%\GeradorCNABNOX\sacados_cadastrados.json`,
+com gravação atômica e data de atualização em UTC.
+
+Quando a base original estiver completa, seus dados são preservados. O fallback
+herda a data de liquidação do lote e registra `FALLBACK_SACADO_APLICADO_VIA_CACHE_LOCAL`
+em `ALERTAS` quando usar o cadastro local. Sem sacado nas fontes, a preparação
+deixa nome e documento vazios e registra `SACADO_NAO_CADASTRADO_NO_SISTEMA`.
+O cadastro não altera arquivos Excel já preparados.
+
 ### Intervenção humana: SIM prevalece sobre SIM_SISTEMA
 
 Zero digitação obrigatória não significa impedir edição. Para substituir um

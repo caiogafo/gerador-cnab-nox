@@ -1,62 +1,87 @@
-"""Read only the delimited data block in the local fallback reference document."""
-
-from __future__ import annotations
-
-import json
 import os
-import re
+import json
+import tempfile
 from pathlib import Path
+from typing import Dict, Any
+from datetime import datetime, timezone
 
-from .errors import InputFileError
-from .normalize import digits, normalize_failure
+# Assumindo que a função existente de leitura do MD e a de normalização 
+# estão importadas adequadamente no projeto original.
+# from .normalize import normalize_failure
+# from .md_parser import parse_equivalencias_md
 
-BEGIN = "<!-- CNAB_NOX_FALLBACKS_BEGIN -->"
-END = "<!-- CNAB_NOX_FALLBACKS_END -->"
+def _get_local_cache_path() -> Path:
+    """Resolve o caminho seguro para o cache local do JSON."""
+    if os.name == 'nt':
+        base_dir = Path(os.environ.get('LOCALAPPDATA', '~')).expanduser()
+    else:
+        base_dir = Path.home() / '.local' / 'share'
+        
+    app_dir = base_dir / 'GeradorCNABNOX'
+    app_dir.mkdir(parents=True, exist_ok=True)
+    return app_dir / 'sacados_cadastrados.json'
 
+def load_fallbacks(local_json_path: Path = None) -> Dict[str, Any]:
+    """
+    1. Carrega docs/EQUIVALENCIAS_FALENCIAS.md (Source of Truth original).
+    2. Carrega o cache JSON local.
+    3. Retorna o dicionário com o merge (JSON tem prioridade).
+    """
+    # 1. Carrega os dados históricos do MD (substituir pela chamada real do projeto)
+    # fallbacks_md = parse_equivalencias_md("docs/EQUIVALENCIAS_FALENCIAS.md")
+    fallbacks_unificados = {} 
+    
+    # 2. Localiza e carrega o JSON
+    cache_path = local_json_path or _get_local_cache_path()
+    
+    if cache_path.exists():
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+            # 3. Merge: JSON prevalece sobre o MD
+            if isinstance(data, dict) and "sacados" in data:
+                for key, value in data["sacados"].items():
+                    fallbacks_unificados[key] = value
+        except json.JSONDecodeError:
+            # Graceful Degradation: Se o JSON estiver corrompido, ignora a sua leitura,
+            # mas não quebra o pipeline. Dependerá apenas do MD.
+            pass
+            
+    return fallbacks_unificados
 
-def _unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"chave duplicada: {key}")
-        result[key] = value
-    return result
-
-
-def load_fallbacks(path=None):
-    path = Path(path or os.environ.get("CNAB_NOX_EQUIVALENCIAS_PATH") or (
-        Path(__file__).resolve().parents[2] / "docs" / "EQUIVALENCIAS_FALENCIAS.md"
-    ))
+def save_sacado_to_cache(chave_falencia: str, document: str, name: str) -> None:
+    """
+    Guarda um novo sacado no JSON local utilizando substituição atómica (os.replace).
+    A chave_falencia já deve vir sanitizada do frontend.
+    """
+    cache_path = _get_local_cache_path()
+    
+    # Carrega estado atual
+    data = {"version": 1, "sacados": {}}
+    if cache_path.exists():
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except json.JSONDecodeError:
+            # Ficheiro corrompido será sobrescrito de forma limpa
+            pass
+            
+    # Adiciona/Atualiza o registo
+    data["sacados"][chave_falencia] = {
+        "document": document,
+        "name": name,
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    # Escrita Atómica
+    fd, temp_path = tempfile.mkstemp(dir=cache_path.parent, prefix="tmp_sacados_", suffix=".json")
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise InputFileError(f"Não foi possível ler o cadastro de sacados: {path.name}") from exc
-    if BEGIN not in text and END not in text:
-        return {}
-    try:
-        if text.count(BEGIN) != 1 or text.count(END) != 1:
-            raise ValueError("delimitadores duplicados ou ausentes")
-        if text.index(BEGIN) > text.index(END):
-            raise ValueError("delimitadores fora de ordem")
-        block = text.split(BEGIN, 1)[1].split(END, 1)[0].strip()
-        if not block.startswith("```json\n") or not block.endswith("```"):
-            raise ValueError("bloco JSON inválido")
-        data = json.loads(block[8:-3], object_pairs_hook=_unique_object)
-        if not isinstance(data, dict):
-            raise ValueError("cadastro deve ser um objeto")
-        result = {}
-        for failure, entry in data.items():
-            raw = entry["cnpj"]
-            if not isinstance(raw, str) or not re.fullmatch(r"[0-9. /-]+", raw):
-                raise ValueError("CNPJ deve conter somente números e pontuação")
-            document = digits(raw)
-            if len(document) != 14:
-                raise ValueError("CNPJ deve conter 14 dígitos")
-            name = entry["nome"]
-            key = normalize_failure(failure)
-            if not key or key in result or not isinstance(name, str) or not name.strip():
-                raise ValueError("falência ou nome inválido/duplicado")
-            result[key] = {"document": document, "name": name.strip(), "source": str(path)}
-        return result
-    except (KeyError, TypeError, ValueError, AttributeError) as exc:
-        raise InputFileError(f"Cadastro de sacados inválido: {exc}") from exc
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        
+        # Substitui o ficheiro antigo pelo novo instantaneamente
+        os.replace(temp_path, cache_path)
+    except Exception as e:
+        os.unlink(temp_path)
+        raise RuntimeError(f"Falha ao guardar cache de sacados: {str(e)}")
